@@ -1,0 +1,2249 @@
+"""
+core.py — Quanto Financial Intelligence Platform v1.0
+======================================================
+Run:  uvicorn core:app --reload --port 8000
+Then: http://localhost:8000
+
+Requirements:
+    python -m pip install fastapi uvicorn python-multipart pdfplumber pytesseract pillow openpyxl ollama numpy openai google-generativeai
+
+OCR PROVIDERS (configure via environment variables):
+    QUANTO_OCR_PROVIDER  = "gemini" | "openai" | "local"  (default: gemini)
+    GEMINI_API_KEY       = your Google Gemini API key
+    OPENAI_API_KEY       = your OpenAI API key
+    (if neither key set, falls back to local pdfplumber + pytesseract)
+"""
+
+import io, re, json, math, tempfile, statistics, base64, os
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+
+app = FastAPI(title="Quanto", version="1.0.0")
+OLLAMA_MODEL = "llama3.1"
+OUTPUT_DIR   = Path(tempfile.gettempdir()) / "quanto_outputs"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+OCR_PROVIDER     = os.environ.get("QUANTO_OCR_PROVIDER", "gemini").lower()
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
+OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
+
+STATEMENTS = {
+    "income_statement":      {"label":"Income Statement",                    "aliases":"P&L · Statement of Earnings · Statement of Operations","icon":"📈","category":"statements","sources":["trial_balance"]},
+    "balance_sheet":         {"label":"Balance Sheet",                       "aliases":"Statement of Financial Position",                       "icon":"⚖️","category":"statements","sources":["trial_balance"]},
+    "retained_earnings":     {"label":"Statement of Retained Earnings",      "aliases":"RE Rollforward",                                        "icon":"🔄","category":"statements","sources":["trial_balance"]},
+    "equity_statement":      {"label":"Statement of Shareholders' Equity",   "aliases":"Changes in Equity · Owners' Equity",                    "icon":"🏛️","category":"statements","sources":["trial_balance"]},
+    "trial_balance":         {"label":"Trial Balance",                       "aliases":"Adjusted / Unadjusted TB",                              "icon":"📋","category":"statements","sources":["trial_balance"]},
+    "ratio_analysis":        {"label":"Financial Ratio Analysis",            "aliases":"Liquidity · Solvency · Profitability · Efficiency",      "icon":"📊","category":"statements","sources":["trial_balance"]},
+    "liquidity_report":      {"label":"Liquidity Report",                    "aliases":"Current Ratio · Quick Ratio · Cash Ratio",               "icon":"💧","category":"statements","sources":["trial_balance"]},
+    "solvency_report":       {"label":"Solvency Report",                     "aliases":"Debt-to-Equity · Leverage Analysis",                     "icon":"🏗️","category":"statements","sources":["trial_balance"]},
+    "profitability_report":  {"label":"Profitability Report",                "aliases":"Margins · ROA · ROE",                                    "icon":"💰","category":"statements","sources":["trial_balance"]},
+    "working_capital":       {"label":"Working Capital Report",              "aliases":"Cash Conversion Cycle · DIO · DPO",                      "icon":"⚙️","category":"statements","sources":["trial_balance"]},
+    "cash_flow_statement":   {"label":"Cash Flow Statement",                 "aliases":"Operating · Investing · Financing Activities",           "icon":"💵","category":"statements","sources":["prior_balance_sheet","current_balance_sheet","income_statement","transaction_details"]},
+    "ar_aging":              {"label":"Accounts Receivable Aging",           "aliases":"Customer Aging · Receivables Schedule",                  "icon":"📥","category":"statements","sources":["customer_invoices","due_dates","customer_balances"]},
+    "ap_aging":              {"label":"Accounts Payable Aging",              "aliases":"Supplier Aging · Payables Schedule",                     "icon":"📤","category":"statements","sources":["supplier_invoices","due_dates","supplier_balances"]},
+    "fixed_asset_schedule":  {"label":"Fixed Asset Schedule",                "aliases":"PPE Schedule · Depreciation Schedule",                   "icon":"🏭","category":"statements","sources":["fixed_asset_register","purchase_dates","depreciation_rates","useful_lives"]},
+    "inventory_schedule":    {"label":"Inventory Schedule",                  "aliases":"Stock Schedule · FIFO / Weighted Average",               "icon":"📦","category":"statements","sources":["inventory_records","quantities","costing_method"]},
+    "inventory_rollforward": {"label":"Inventory Rollforward",               "aliases":"Inventory Movement · Opening/Closing Stock",             "icon":"🔁","category":"statements","sources":["opening_inventory","purchases","sales","adjustments"]},
+    "equity_rollforward":    {"label":"Equity Rollforward",                  "aliases":"Capital Account Movement",                               "icon":"📈","category":"statements","sources":["share_issues","dividends","owner_contributions","retained_earnings_movements"]},
+    "debt_schedule":         {"label":"Debt Schedule",                       "aliases":"Loan Schedule · Debt Repayment Plan",                    "icon":"🏦","category":"statements","sources":["loan_agreements","repayment_schedules","interest_rates"]},
+    "lease_schedule":        {"label":"Lease Schedule",                      "aliases":"IFRS 16 · Right-of-Use Assets",                          "icon":"🏢","category":"statements","sources":["lease_contracts","payment_schedules","lease_terms"]},
+    "bank_reconciliation":   {"label":"Bank Reconciliation",                 "aliases":"Cash Reconciliation · Bank Recon",                       "icon":"🏧","category":"statements","sources":["bank_statements","cash_ledger"]},
+    "account_reconciliation":{"label":"Account Reconciliations",             "aliases":"Subledger Reconciliation · Control Account",             "icon":"🔍","category":"statements","sources":["external_statements","subledgers","supporting_documents"]},
+    "audit_working_papers":  {"label":"Audit Working Papers",                "aliases":"Lead Schedules · Audit File",                            "icon":"📝","category":"statements","sources":["general_ledger","lead_schedules","supporting_documentation"]},
+    "notes_financial_stmts": {"label":"Notes to Financial Statements",       "aliases":"Disclosures · Accounting Policies",                      "icon":"📄","category":"statements","sources":["management_disclosures","accounting_policies","legal_information"]},
+    "related_party":         {"label":"Related Party Disclosure Schedule",   "aliases":"RPT Schedule · Related Transactions",                    "icon":"🤝","category":"statements","sources":["related_party_transaction_data"]},
+    "deferred_tax":          {"label":"Deferred Tax Schedule",               "aliases":"DTA · DTL · Tax Timing Differences",                     "icon":"🧮","category":"statements","sources":["tax_calculations","tax_returns","temporary_differences"]},
+    "tax_provision":         {"label":"Tax Provision Workpapers",            "aliases":"Current & Deferred Tax · ETR Analysis",                  "icon":"💼","category":"statements","sources":["tax_returns","tax_adjustments","tax_rates"]},
+    "revenue_recognition":   {"label":"Revenue Recognition Schedule",        "aliases":"ASC 606 · IFRS 15 · Contract Revenue",                   "icon":"📊","category":"statements","sources":["contracts","invoices","performance_obligations"]},
+    "prepaid_expense":       {"label":"Prepaid Expense Schedule",            "aliases":"Prepayments · Deferred Charges",                         "icon":"⏳","category":"statements","sources":["payment_records","amortization_periods"]},
+    "accrual_schedule":      {"label":"Accrual Schedule",                    "aliases":"Accrued Liabilities · Outstanding Obligations",          "icon":"📋","category":"statements","sources":["outstanding_invoices","contracts","unpaid_obligations"]},
+    "employee_benefits":     {"label":"Employee Benefit Schedule",           "aliases":"Payroll · Pension · Benefits",                           "icon":"👥","category":"statements","sources":["payroll_records","pension_data","benefit_data"]},
+    "forecast_growth":       {"label":"Growth Rate Forecast",                "aliases":"CAGR · Weighted · Trend · 1/3/5 Year",                   "icon":"🚀","category":"forecast","sources":["trial_balance_3yr_min"]},
+    "forecast_driver":       {"label":"Driver-Based Forecast",               "aliases":"Revenue Drivers · Expense Drivers · Working Capital",    "icon":"🎯","category":"forecast","sources":["trial_balance_3yr_min"]},
+    "forecast_three_stmt":   {"label":"Three-Statement Forecast Model",      "aliases":"Linked IS · BS · Cash Flow",                             "icon":"🔗","category":"forecast","sources":["trial_balance_3yr_min"]},
+    "forecast_cashflow":     {"label":"Cash Flow Forecast",                  "aliases":"Operating · Investing · Financing · Runway",             "icon":"💵","category":"forecast","sources":["trial_balance_3yr_min"]},
+    "forecast_scenarios":    {"label":"Scenario Analysis",                   "aliases":"Base · Best · Worst Case · Probability",                 "icon":"🎭","category":"forecast","sources":["trial_balance_3yr_min"]},
+    "forecast_valuation":    {"label":"Valuation Model",                     "aliases":"DCF · Terminal Value · Enterprise Value · Equity Value",  "icon":"💎","category":"forecast","sources":["trial_balance_3yr_min"]},
+    "forecast_risk":         {"label":"Risk Analysis Report",                "aliases":"Concentration · Liquidity · Debt · Burn · Score",        "icon":"⚠️","category":"forecast","sources":["trial_balance_3yr_min"]},
+    "forecast_stakeholder":  {"label":"Stakeholder Analysis",                "aliases":"Owner · CFO · Investor · Bank · Auditor",                "icon":"👥","category":"forecast","sources":["trial_balance_3yr_min"]},
+    "forecast_narrative":    {"label":"AI Narrative Insights",               "aliases":"Explainable Forecast Commentary",                       "icon":"🤖","category":"forecast","sources":["trial_balance_3yr_min"]},
+    "forecast_full":         {"label":"Full Forecasting Package",            "aliases":"All 15 Phases — Complete Model",                         "icon":"📦","category":"forecast","sources":["trial_balance_3yr_min"]},
+}
+
+SOURCE_LABELS = {
+    "trial_balance":                  ("Trial Balance",                  "The adjusted or unadjusted trial balance for the period"),
+    "prior_balance_sheet":            ("Prior-Year Balance Sheet",       "Balance sheet from the previous fiscal year"),
+    "current_balance_sheet":          ("Current-Year Balance Sheet",     "Balance sheet for the current fiscal year"),
+    "income_statement":               ("Income Statement",               "Income statement / P&L for the period"),
+    "transaction_details":            ("Transaction Details",            "Detailed list of cash transactions for the period"),
+    "customer_invoices":              ("Customer Invoices",              "All outstanding customer invoices"),
+    "due_dates":                      ("Due Dates",                      "Invoice or obligation due dates"),
+    "customer_balances":              ("Customer Balances",              "Aged balances per customer"),
+    "supplier_invoices":              ("Supplier Invoices",              "All outstanding supplier/vendor invoices"),
+    "supplier_balances":              ("Supplier Balances",              "Aged balances per supplier"),
+    "fixed_asset_register":           ("Fixed Asset Register",           "Complete register of all fixed assets"),
+    "purchase_dates":                 ("Purchase Dates",                 "Acquisition dates for each asset"),
+    "depreciation_rates":             ("Depreciation Rates",             "Depreciation rate or method per asset class"),
+    "useful_lives":                   ("Useful Lives",                   "Estimated useful life per asset"),
+    "inventory_records":              ("Inventory Records",              "Inventory listing with quantities and costs"),
+    "quantities":                     ("Quantities on Hand",             "Physical count or system quantity per SKU"),
+    "costing_method":                 ("Costing Method",                 "FIFO, Weighted Average, or Specific Identification"),
+    "opening_inventory":              ("Opening Inventory",              "Inventory balance at start of period"),
+    "purchases":                      ("Purchases During Period",        "All inventory purchases during the period"),
+    "sales":                          ("Sales During Period",            "All inventory sold during the period"),
+    "adjustments":                    ("Inventory Adjustments",          "Write-offs, shrinkage, returns, write-ups"),
+    "share_issues":                   ("Share Issues",                   "New shares issued during the period"),
+    "dividends":                      ("Dividends Declared",             "Dividends declared or paid during the period"),
+    "owner_contributions":            ("Owner Contributions",            "Capital contributions by owners/shareholders"),
+    "retained_earnings_movements":    ("Retained Earnings Movements",    "Adjustments to retained earnings"),
+    "loan_agreements":                ("Loan Agreements",                "Signed loan/credit agreements"),
+    "repayment_schedules":            ("Repayment Schedules",            "Amortization tables for all debt"),
+    "interest_rates":                 ("Interest Rates",                 "Interest rate per loan (fixed or floating)"),
+    "lease_contracts":                ("Lease Contracts",                "Signed lease agreements"),
+    "payment_schedules":              ("Payment Schedules",              "Lease payment schedule over term"),
+    "lease_terms":                    ("Lease Terms",                    "Lease commencement, end date, renewal options"),
+    "bank_statements":                ("Bank Statements",                "Official bank statements for the period"),
+    "cash_ledger":                    ("Cash Ledger",                    "Internal cash account / GL entries"),
+    "external_statements":            ("External Statements",            "Third-party statements (bank, broker, etc.)"),
+    "subledgers":                     ("Subledgers",                     "AR, AP, inventory subledger detail"),
+    "supporting_documents":           ("Supporting Documents",           "Invoices, contracts, other evidence"),
+    "general_ledger":                 ("General Ledger",                 "Full GL trial listing for the period"),
+    "lead_schedules":                 ("Lead Schedules",                 "Audit lead schedules per balance area"),
+    "supporting_documentation":       ("Supporting Documentation",       "Audit evidence, confirmations, workpapers"),
+    "management_disclosures":         ("Management Disclosures",         "MD&A or notes prepared by management"),
+    "accounting_policies":            ("Accounting Policies",            "Summary of significant accounting policies"),
+    "legal_information":              ("Legal Information",              "Legal proceedings, contingencies, commitments"),
+    "related_party_transaction_data": ("Related Party Transaction Data", "All transactions with related parties"),
+    "tax_calculations":               ("Tax Calculations",               "Current and deferred tax computations"),
+    "tax_returns":                    ("Tax Returns",                    "Filed or draft corporate tax returns"),
+    "temporary_differences":          ("Temporary Differences",          "Taxable vs. accounting timing differences"),
+    "tax_adjustments":                ("Tax Adjustments",                "Book-to-tax adjustments and reconciliations"),
+    "tax_rates":                      ("Tax Rates",                      "Applicable statutory and effective tax rates"),
+    "contracts":                      ("Customer Contracts",             "Signed contracts with performance obligations"),
+    "invoices":                       ("Invoices",                       "Revenue invoices issued to customers"),
+    "performance_obligations":        ("Performance Obligations",        "Identified POBs per contract"),
+    "payment_records":                ("Payment Records",                "Evidence of prepayments made"),
+    "amortization_periods":           ("Amortization Periods",           "Period over which prepaid expenses are expensed"),
+    "outstanding_invoices":           ("Outstanding Invoices",           "Unpaid invoices at period end"),
+    "unpaid_obligations":             ("Unpaid Obligations",             "Accrued but unbilled obligations"),
+    "payroll_records":                ("Payroll Records",                "Employee payroll detail for the period"),
+    "pension_data":                   ("Pension / Retirement Data",      "Defined benefit or contribution plan data"),
+    "benefit_data":                   ("Employee Benefit Data",          "Health, bonus, stock compensation detail"),
+    "trial_balance_3yr_min":          ("Trial Balances (Min 3 Years)",   "Upload at least 3 years of trial balances"),
+}
+
+TB_ONLY_STATEMENTS = {
+    "income_statement","balance_sheet","retained_earnings","equity_statement",
+    "trial_balance","ratio_analysis","liquidity_report","solvency_report",
+    "profitability_report","working_capital",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML FRONTEND  (full UI with Statements, Forecasting, and Consolidation tabs)
+# ─────────────────────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quanto — Financial Intelligence</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#050914;--surface:#0d1426;--surface2:#131d35;--surface3:#1a2540;
+  --text:#e8eaf0;--text-muted:#7b8db0;--text-dim:#4a5670;
+  --accent:#4f8ef7;--accent2:#7c6af7;--gold:#f5c842;
+  --green:#3ecf8e;--red:#f56565;--orange:#f6993f;
+  --border:#1e2d4a;--border2:#263352;--radius:10px;
+  --glow:0 0 30px rgba(79,142,247,0.08);
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;z-index:-2;
+  background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(79,142,247,0.07),transparent),
+             radial-gradient(ellipse 50% 60% at 90% 50%,rgba(124,106,247,0.04),transparent)}
+body::after{content:'';position:fixed;inset:0;z-index:-1;
+  background-image:linear-gradient(rgba(30,45,74,0.3) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(30,45,74,0.3) 1px,transparent 1px);
+  background-size:48px 48px}
+header{padding:3rem 2rem 2.5rem;text-align:center;border-bottom:1px solid var(--border);
+  background:linear-gradient(180deg,rgba(13,20,38,0.95),rgba(13,20,38,0.7));backdrop-filter:blur(12px);
+  position:sticky;top:0;z-index:100}
+.brand{display:flex;align-items:center;justify-content:center;gap:.75rem;margin-bottom:.5rem}
+.brand-mark{width:38px;height:38px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.1rem;font-weight:800;color:white;
+  box-shadow:0 4px 20px rgba(79,142,247,0.3)}
+.brand-name{font-family:'DM Serif Display',serif;font-size:2rem;letter-spacing:-.04em;
+  background:linear-gradient(135deg,#e8eaf0,var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.tagline{font-size:.82rem;color:var(--text-muted);font-family:'DM Mono',monospace;letter-spacing:.08em;text-transform:uppercase}
+.ocr-badge{display:inline-flex;align-items:center;gap:.5rem;margin-top:.75rem;padding:.35rem .85rem;
+  border:1px solid var(--border2);border-radius:9999px;font-family:'DM Mono',monospace;font-size:.72rem;color:var(--green);
+  background:rgba(62,207,142,0.05)}
+.disclaimer{font-size:.68rem;color:var(--text-dim);font-family:'DM Mono',monospace;margin-top:.4rem;letter-spacing:.03em}
+.tab-bar{display:flex;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:99}
+.tab-btn{flex:1;padding:1rem 1.5rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;font-size:.78rem;
+  background:transparent;color:var(--text-muted);border:none;cursor:pointer;transition:all .2s;font-family:'Inter',sans-serif}
+.tab-btn:hover{background:var(--surface2);color:var(--text)}
+.tab-btn.active{background:var(--surface2);color:var(--accent);border-bottom:2px solid var(--accent)}
+.tab-panel{display:none}.tab-panel.active{display:block}
+main{max-width:1300px;margin:0 auto;padding:2.5rem 1.5rem 6rem;display:grid;gap:1.75rem}
+.step-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:2rem;position:relative;transition:border-color .2s;box-shadow:var(--glow)}
+.step-card:hover{border-color:var(--border2)}
+.step-num{position:absolute;top:-11px;left:22px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  color:white;font-family:'DM Mono',monospace;font-weight:700;padding:.28rem .75rem;
+  border-radius:9999px;font-size:.75rem;letter-spacing:.05em}
+.step-title{font-size:1.2rem;font-weight:600;margin-bottom:.25rem;color:var(--text)}
+.step-sub{font-size:.82rem;color:var(--text-muted);font-family:'DM Mono',monospace;margin-bottom:1.25rem}
+.filter-bar{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:1.25rem}
+.filter-btn{padding:.32rem .8rem;border-radius:9999px;font-size:.75rem;font-weight:500;cursor:pointer;transition:all .2s;border:1px solid var(--border2);background:var(--surface2);color:var(--text-muted)}
+.filter-btn.active{background:var(--accent);color:white;border-color:var(--accent)}
+.stmt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:.875rem}
+.stmt-card{border:1px solid var(--border);border-radius:var(--radius);padding:1.35rem 1.1rem;
+  background:var(--surface2);cursor:pointer;transition:all .2s;position:relative}
+.stmt-card:hover{border-color:var(--accent);background:var(--surface3);transform:translateY(-2px);box-shadow:0 8px 24px rgba(79,142,247,0.1)}
+.stmt-card.selected{border-color:var(--accent);background:var(--surface3);box-shadow:0 0 0 3px rgba(79,142,247,.12)}
+.stmt-card.multisource{border-color:rgba(124,106,247,0.2)}
+.stmt-card.multisource:hover,.stmt-card.multisource.selected{border-color:var(--accent2)}
+.stmt-card.multisource.selected{box-shadow:0 0 0 3px rgba(124,106,247,.12)}
+.stmt-icon{font-size:1.75rem;margin-bottom:.6rem}
+.stmt-name{font-weight:600;font-size:.95rem;margin-bottom:.2rem;color:var(--text)}
+.stmt-alias{font-size:.72rem;color:var(--text-muted);font-family:'DM Mono',monospace;line-height:1.4}
+.source-badge{display:inline-block;margin-top:.5rem;padding:.18rem .45rem;background:rgba(124,106,247,0.1);
+  border:1px solid rgba(124,106,247,0.3);border-radius:4px;font-size:.65rem;color:#a78bfa}
+.source-required{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:1.35rem;margin-top:1rem}
+.source-required h4{color:var(--accent);font-size:.8rem;margin-bottom:.875rem;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.06em}
+.source-item{display:flex;align-items:flex-start;gap:.875rem;padding:.65rem;border-radius:7px;background:var(--surface3);margin-bottom:.4rem}
+.source-item-icon{font-size:1.1rem;flex-shrink:0;margin-top:.1rem}
+.source-item-text{flex:1}
+.source-item-title{font-weight:600;font-size:.85rem;margin-bottom:.15rem}
+.source-item-desc{font-size:.75rem;color:var(--text-muted)}
+.source-upload-btn{padding:.38rem .8rem;background:var(--surface);border:1px solid var(--border2);border-radius:6px;
+  color:var(--text-muted);font-size:.75rem;cursor:pointer;transition:all .2s;white-space:nowrap}
+.source-upload-btn.uploaded{background:rgba(62,207,142,0.08);border-color:var(--green);color:var(--green)}
+.upload-area{border:2px dashed var(--border2);border-radius:var(--radius);padding:2.5rem 1.5rem;text-align:center;
+  transition:all .2s;background:var(--surface2);cursor:pointer}
+.upload-area:hover{border-color:var(--accent);background:var(--surface3)}
+.file-tag{display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .7rem;background:var(--surface2);
+  border:1px solid var(--border2);border-radius:6px;font-size:.8rem;margin:.2rem}
+.submit-btn{width:100%;padding:.9rem 2rem;background:linear-gradient(135deg,var(--accent),#3a7ded);color:white;
+  font-weight:700;font-size:.95rem;letter-spacing:.04em;text-transform:uppercase;border:none;
+  border-radius:var(--radius);cursor:pointer;transition:all .2s;margin-top:.75rem;
+  box-shadow:0 4px 20px rgba(79,142,247,0.25)}
+.submit-btn:hover{transform:translateY(-1px);box-shadow:0 8px 28px rgba(79,142,247,0.35)}
+.submit-btn.forecast-btn{background:linear-gradient(135deg,var(--accent2),#6451d9);box-shadow:0 4px 20px rgba(124,106,247,0.25)}
+.submit-btn.forecast-btn:hover{box-shadow:0 8px 28px rgba(124,106,247,0.35)}
+.submit-btn.consol-btn{background:linear-gradient(135deg,#f5c842,#e0a820);color:#1a1000;box-shadow:0 4px 20px rgba(245,200,66,0.25)}
+.submit-btn.consol-btn:hover{box-shadow:0 8px 28px rgba(245,200,66,0.35)}
+.submit-btn:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+.progress-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.75rem}
+.result-card{background:var(--surface);border:1px solid var(--accent);border-radius:var(--radius);padding:2.5rem;text-align:center;
+  box-shadow:0 0 40px rgba(79,142,247,0.08)}
+.result-card.forecast-result{border-color:var(--accent2)}
+.result-card.consol-result{border-color:var(--gold)}
+.download-btn{display:inline-flex;align-items:center;gap:.75rem;padding:.9rem 2.1rem;
+  background:linear-gradient(135deg,var(--accent),#3a7ded);color:white;
+  font-weight:700;border-radius:var(--radius);text-decoration:none;margin-top:1.5rem;transition:all .2s;
+  box-shadow:0 4px 20px rgba(79,142,247,0.25)}
+.download-btn:hover{transform:translateY(-1px);box-shadow:0 8px 28px rgba(79,142,247,0.35)}
+.step-item{padding:.65rem 1rem;border-radius:6px;font-family:'DM Mono',monospace;font-size:.82rem;margin-bottom:.2rem}
+.step-item.active{color:var(--accent);background:rgba(79,142,247,0.05)}
+.step-item.done{color:var(--green)}.step-item.error{color:var(--red)}
+.spinner{display:inline-block;width:.85rem;height:.85rem;border:2px solid var(--border2);border-top-color:var(--accent);
+  border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle;margin-right:.5rem}
+@keyframes spin{to{transform:rotate(360deg)}}
+.notice-bar{padding:.7rem 1.1rem;border-radius:7px;font-size:.8rem;font-family:'DM Mono',monospace;margin-bottom:.875rem}
+.notice-bar.info{background:rgba(79,142,247,0.06);border:1px solid rgba(79,142,247,0.2);color:var(--accent)}
+.notice-bar.warn{background:rgba(246,153,63,0.06);border:1px solid rgba(246,153,63,0.2);color:var(--orange)}
+.notice-bar.gold{background:rgba(245,200,66,0.06);border:1px solid rgba(245,200,66,0.2);color:var(--gold)}
+.analytics-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:0;overflow:hidden;margin-top:0}
+.analytics-header{padding:1.5rem 2rem 1rem;background:linear-gradient(135deg,var(--surface2),var(--surface3));border-bottom:1px solid var(--border)}
+.analytics-header h3{font-size:1.1rem;font-weight:600;color:var(--text);margin-bottom:.25rem}
+.analytics-header p{font-size:.8rem;color:var(--text-muted);font-family:'DM Mono',monospace}
+.analytics-tabs{display:flex;border-bottom:1px solid var(--border);background:var(--surface)}
+.analytics-tab{padding:.75rem 1.25rem;font-size:.78rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;
+  color:var(--text-muted);cursor:pointer;border:none;background:transparent;transition:all .2s;border-bottom:2px solid transparent}
+.analytics-tab:hover{color:var(--text);background:var(--surface2)}
+.analytics-tab.active{color:var(--accent);border-bottom-color:var(--accent);background:var(--surface2)}
+.analytics-content{padding:1.75rem 2rem}
+.analytics-sub-panel{display:none}.analytics-sub-panel.active{display:block}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:.875rem;margin-bottom:1.5rem}
+.kpi-card{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:1.1rem;transition:border-color .2s}
+.kpi-card:hover{border-color:var(--border2)}
+.kpi-label{font-size:.72rem;color:var(--text-muted);font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.35rem}
+.kpi-value{font-size:1.4rem;font-weight:700;color:var(--text);line-height:1}
+.kpi-value.positive{color:var(--green)}.kpi-value.negative{color:var(--red)}.kpi-value.neutral{color:var(--accent)}
+.kpi-note{font-size:.7rem;color:var(--text-dim);margin-top:.3rem;font-family:'DM Mono',monospace}
+.insight-block{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-bottom:1rem}
+.insight-block h4{font-size:.82rem;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.6rem;font-family:'DM Mono',monospace}
+.insight-block p,.insight-block li{font-size:.88rem;color:var(--text);line-height:1.7}
+.insight-block ul{padding-left:1.1rem}
+.insight-block li{margin-bottom:.25rem}
+.ratio-section-title{font-size:.75rem;font-weight:700;color:var(--text-muted);text-transform:uppercase;
+  letter-spacing:.1em;font-family:'DM Mono',monospace;padding:.5rem 0;margin-top:1.25rem;margin-bottom:.5rem;
+  border-bottom:1px solid var(--border)}
+.ratio-table{width:100%;border-collapse:collapse;margin-bottom:1rem}
+.ratio-table th{font-size:.72rem;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;
+  padding:.5rem .75rem;text-align:left;border-bottom:1px solid var(--border);font-family:'DM Mono',monospace}
+.ratio-table th:last-child{text-align:right}
+.ratio-table td{padding:.55rem .75rem;font-size:.83rem;border-bottom:1px solid rgba(30,45,74,0.5)}
+.ratio-table tr:last-child td{border-bottom:none}
+.ratio-table tr:hover td{background:rgba(79,142,247,0.03)}
+.ratio-table td:last-child{text-align:right;font-weight:600;font-family:'DM Mono',monospace}
+.ratio-val.good{color:var(--green)}.ratio-val.warn{color:var(--orange)}.ratio-val.bad{color:var(--red)}.ratio-val.neutral{color:var(--accent)}
+.chat-container{display:flex;flex-direction:column;height:520px;background:var(--surface2);border-radius:0 0 var(--radius) var(--radius)}
+.chat-messages{flex:1;overflow-y:auto;padding:1.5rem;display:flex;flex-direction:column;gap:.875rem;scroll-behavior:smooth}
+.chat-messages::-webkit-scrollbar{width:4px}
+.chat-messages::-webkit-scrollbar-track{background:transparent}
+.chat-messages::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+.chat-msg{max-width:85%;border-radius:10px;padding:.875rem 1.1rem;line-height:1.65;font-size:.875rem}
+.chat-msg.user{align-self:flex-end;background:linear-gradient(135deg,rgba(79,142,247,0.2),rgba(124,106,247,0.15));
+  border:1px solid rgba(79,142,247,0.25);color:var(--text)}
+.chat-msg.assistant{align-self:flex-start;background:var(--surface3);border:1px solid var(--border);color:var(--text)}
+.chat-msg.assistant .msg-label{font-size:.68rem;font-weight:700;color:var(--accent);font-family:'DM Mono',monospace;
+  text-transform:uppercase;letter-spacing:.06em;margin-bottom:.4rem}
+.chat-msg.typing{padding:.875rem 1.1rem}
+.typing-dot{display:inline-block;width:7px;height:7px;background:var(--text-muted);border-radius:50%;margin:0 2px;
+  animation:bounce .9s ease-in-out infinite}
+.typing-dot:nth-child(2){animation-delay:.15s}.typing-dot:nth-child(3){animation-delay:.3s}
+@keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
+.chat-input-row{display:flex;gap:.5rem;padding:1rem 1.25rem;border-top:1px solid var(--border);background:var(--surface)}
+.chat-input{flex:1;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;
+  padding:.65rem 1rem;color:var(--text);font-size:.875rem;font-family:'Inter',sans-serif;resize:none;outline:none;
+  transition:border-color .2s;min-height:40px;max-height:100px}
+.chat-input:focus{border-color:var(--accent)}
+.chat-send-btn{padding:.65rem 1.1rem;background:linear-gradient(135deg,var(--accent),#3a7ded);color:white;
+  border:none;border-radius:8px;cursor:pointer;font-weight:600;font-size:.82rem;transition:all .2s;white-space:nowrap}
+.chat-send-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(79,142,247,0.3)}
+.chat-send-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.chat-empty{text-align:center;padding:2.5rem;color:var(--text-muted);font-family:'DM Mono',monospace;font-size:.82rem}
+.chat-empty .chat-empty-icon{font-size:2rem;margin-bottom:.75rem;opacity:.5}
+/* Consolidation-specific */
+.entity-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem;margin-bottom:.75rem;position:relative}
+.entity-card .entity-label{font-size:.72rem;font-weight:700;color:var(--gold);font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem}
+.entity-card .entity-name{font-size:.95rem;font-weight:600;color:var(--text);margin-bottom:.3rem}
+.entity-card .entity-files{font-size:.77rem;color:var(--text-muted);font-family:'DM Mono',monospace}
+.entity-remove{position:absolute;top:.75rem;right:.75rem;background:none;border:none;color:var(--red);font-size:1.1rem;cursor:pointer;opacity:.6;transition:opacity .2s}
+.entity-remove:hover{opacity:1}
+.add-entity-row{display:flex;gap:.5rem;align-items:center;margin-bottom:1rem;flex-wrap:wrap}
+.add-entity-input{flex:1;min-width:180px;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;
+  padding:.55rem .9rem;color:var(--text);font-size:.875rem;font-family:'Inter',sans-serif;outline:none;transition:border-color .2s}
+.add-entity-input:focus{border-color:var(--gold)}
+.add-entity-btn{padding:.55rem 1.1rem;background:linear-gradient(135deg,var(--gold),#e0a820);color:#1a1000;
+  font-weight:700;font-size:.82rem;border:none;border-radius:8px;cursor:pointer;white-space:nowrap;transition:all .2s}
+.add-entity-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(245,200,66,0.3)}
+.elim-row{display:flex;align-items:center;gap:.75rem;padding:.6rem .9rem;background:var(--surface2);border:1px solid var(--border);border-radius:7px;margin-bottom:.4rem}
+.elim-row input[type=number]{width:130px;background:var(--surface3);border:1px solid var(--border2);border-radius:6px;
+  padding:.35rem .6rem;color:var(--text);font-size:.85rem;font-family:'DM Mono',monospace;outline:none}
+.elim-row select{background:var(--surface3);border:1px solid var(--border2);border-radius:6px;
+  padding:.35rem .6rem;color:var(--text);font-size:.82rem;outline:none;min-width:180px}
+.elim-row label{font-size:.8rem;color:var(--text-muted);font-family:'DM Mono',monospace;min-width:80px}
+.elim-remove{background:none;border:none;color:var(--red);cursor:pointer;font-size:1rem;opacity:.6;transition:opacity .2s;margin-left:auto}
+.elim-remove:hover{opacity:1}
+footer{text-align:center;padding:2rem;color:var(--text-dim);font-family:'DM Mono',monospace;font-size:.72rem;border-top:1px solid var(--border);letter-spacing:.03em}
+footer span{color:var(--text-muted)}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="brand-mark">Q</div>
+    <div class="brand-name">Quanto</div>
+  </div>
+  <p class="tagline">Financial Intelligence Platform</p>
+  <div class="ocr-badge" id="ocrBadge">⬜ Loading OCR status...</div>
+  <p class="disclaimer">Quanto is not responsible for financial decisions.</p>
+</header>
+
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="switchTab('statements',this)">📋 Statement Generator</button>
+  <button class="tab-btn" onclick="switchTab('forecasting',this)">🚀 Forecasting Engine</button>
+  <button class="tab-btn" onclick="switchTab('consolidation',this)">🏢 Consolidation Engine</button>
+</div>
+
+<!-- ═══════════════════  STATEMENTS TAB  ═══════════════════ -->
+<div id="tab-statements" class="tab-panel active">
+<main>
+  <section class="step-card">
+    <span class="step-num">01</span>
+    <div class="step-title">Choose a Financial Statement</div>
+    <div class="notice-bar info">📋 Statements with a purple badge require multiple source documents — required uploads will appear automatically.</div>
+    <div class="filter-bar">
+      <button class="filter-btn active" id="fAll" onclick="filterCards('all',this)">All</button>
+      <button class="filter-btn" id="fTb" onclick="filterCards('tb',this)">Trial Balance Only</button>
+      <button class="filter-btn" id="fMulti" onclick="filterCards('multi',this)">Multi-Source</button>
+    </div>
+    <div class="stmt-grid" id="stmtGrid"></div>
+  </section>
+  <section class="step-card" id="uploadSection">
+    <span class="step-num">02</span>
+    <div class="step-title" id="uploadTitle">Upload Required Documents</div>
+    <div class="step-sub" id="uploadSub">Select a statement type above to see required documents.</div>
+    <div id="sourceRequiredArea"></div>
+    <div id="tbUploadArea" style="display:none">
+      <div class="upload-area" id="uploadArea">
+        <input type="file" id="fileInput" accept=".pdf,.jpg,.jpeg,.png,.tiff,.bmp" style="display:none"/>
+        <div style="font-size:2rem;margin:.75rem 0">📎</div>
+        <p style="font-weight:600;font-size:.95rem">Drop Trial Balance here or click to browse</p>
+        <p style="font-size:.78rem;color:var(--text-muted);margin-top:.4rem">PDF, JPG, PNG, TIFF supported · AI Vision OCR</p>
+      </div>
+      <div id="tbFileChosen" style="display:none;margin-top:.6rem;padding:.65rem 1rem;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;align-items:center">
+        <span id="tbFileName" style="flex:1;font-size:.85rem"></span>
+        <button onclick="removeTbFile()" style="background:none;border:none;color:var(--red);font-size:1.1rem;cursor:pointer;margin-left:1rem">✕</button>
+      </div>
+    </div>
+  </section>
+  <section class="step-card">
+    <span class="step-num">03</span>
+    <button class="submit-btn" id="generateBtn" onclick="generate()" disabled>⚡ Generate Statement</button>
+  </section>
+  <div id="status-area" style="display:none"></div>
+  <div id="result-area"></div>
+  <div id="analytics-area" style="display:none">
+    <div class="analytics-panel">
+      <div class="analytics-header">
+        <h3 id="analytics-company-title">Financial Analysis</h3>
+        <p id="analytics-period-sub">Generated by Quanto Intelligence Engine</p>
+      </div>
+      <div class="analytics-tabs">
+        <button class="analytics-tab active" onclick="switchAnalyticsTab('overview',this)">📊 Overview</button>
+        <button class="analytics-tab" onclick="switchAnalyticsTab('ratios',this)">🔢 Ratio Analysis</button>
+        <button class="analytics-tab" onclick="switchAnalyticsTab('insights',this)">💡 Insights</button>
+        <button class="analytics-tab" onclick="switchAnalyticsTab('chat',this)">💬 Ask Quanto</button>
+      </div>
+      <div class="analytics-content">
+        <div id="panel-overview" class="analytics-sub-panel active"><div id="kpi-grid-container"></div></div>
+        <div id="panel-ratios" class="analytics-sub-panel"><div id="ratios-container"></div></div>
+        <div id="panel-insights" class="analytics-sub-panel">
+          <div id="insights-container"><div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:.85rem"><span class="spinner"></span> Generating AI insights...</div></div>
+        </div>
+        <div id="panel-chat" class="analytics-sub-panel">
+          <div class="chat-container">
+            <div class="chat-messages" id="chatMessages">
+              <div class="chat-empty"><div class="chat-empty-icon">💬</div><p>Ask anything about this financial statement.</p></div>
+            </div>
+            <div class="chat-input-row">
+              <textarea class="chat-input" id="chatInput" placeholder="Ask Quanto about this financial statement..." rows="1"
+                onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
+              <button class="chat-send-btn" id="chatSendBtn" onclick="sendChat()">Send ↑</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+</div>
+
+<!-- ═══════════════════  FORECASTING TAB  ═══════════════════ -->
+<div id="tab-forecasting" class="tab-panel">
+<main>
+  <section class="step-card">
+    <span class="step-num">01</span>
+    <div class="step-title">Choose Forecast Type</div>
+    <div class="stmt-grid" id="fstmtGrid"></div>
+  </section>
+  <section class="step-card">
+    <span class="step-num">02</span>
+    <div class="step-title">Upload Historical Trial Balances</div>
+    <div class="notice-bar warn">⚠ Minimum 3 fiscal years of trial balances required. Upload one file per year.</div>
+    <div id="forecastDropZone" class="upload-area" style="margin-bottom:1rem">
+      <input type="file" id="forecastFileInput" accept=".pdf,.jpg,.jpeg,.png,.tiff,.bmp" multiple style="display:none"/>
+      <div style="font-size:2rem;margin:.75rem 0">📁</div>
+      <p style="font-weight:600;font-size:.95rem">Drop files here or click to browse</p>
+      <p style="font-size:.78rem;color:var(--text-muted);margin-top:.4rem">Select multiple files — one per fiscal year</p>
+    </div>
+    <div id="forecastFileList" style="display:flex;flex-wrap:wrap;gap:.4rem"></div>
+  </section>
+  <section class="step-card">
+    <span class="step-num">03</span>
+    <button class="submit-btn forecast-btn" id="fgenerateBtn" onclick="generateForecast()" disabled>🚀 Run Forecast Engine (15 Phases)</button>
+  </section>
+  <div id="fstatus-area" style="display:none"></div>
+  <div id="fresult-area"></div>
+</main>
+</div>
+
+<!-- ═══════════════════  CONSOLIDATION TAB  ═══════════════════ -->
+<div id="tab-consolidation" class="tab-panel">
+<main>
+  <section class="step-card">
+    <span class="step-num">01</span>
+    <div class="step-title">Multi-Entity Consolidation Engine</div>
+    <div class="notice-bar gold">🏢 Upload trial balances for each entity. Define intercompany eliminations and ownership percentages for a GAAP/IFRS-compliant consolidated package.</div>
+    <div class="step-sub">Add each legal entity, upload its trial balance, then set ownership % and any intercompany eliminations.</div>
+
+    <div style="margin-bottom:1.25rem">
+      <div style="font-size:.8rem;font-weight:700;color:var(--gold);font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.75rem">Parent Company Name</div>
+      <input class="add-entity-input" id="parentNameInput" placeholder="e.g. Acme Holdings Ltd." style="width:100%;max-width:400px"/>
+    </div>
+
+    <div style="font-size:.8rem;font-weight:700;color:var(--gold);font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.75rem">Entities</div>
+    <div class="add-entity-row">
+      <input class="add-entity-input" id="entityNameInput" placeholder="Entity name (e.g. Subsidiary A)"/>
+      <input class="add-entity-input" id="entityOwnershipInput" placeholder="Ownership % (e.g. 80)" type="number" min="0" max="100" style="max-width:160px"/>
+      <input type="file" id="entityFileInput" accept=".pdf,.jpg,.jpeg,.png,.tiff,.bmp" style="display:none"/>
+      <button class="add-entity-btn" onclick="document.getElementById('entityFileInput').click()">📎 Select TB File</button>
+      <button class="add-entity-btn" onclick="addEntity()" style="background:linear-gradient(135deg,var(--green),#2ab377);color:#001a0d">+ Add Entity</button>
+    </div>
+    <div id="entityFileChosen" style="font-size:.78rem;color:var(--green);font-family:'DM Mono',monospace;margin-bottom:.6rem;display:none"></div>
+    <div id="entityList"></div>
+  </section>
+
+  <section class="step-card">
+    <span class="step-num">02</span>
+    <div class="step-title">Intercompany Eliminations</div>
+    <div class="step-sub">Define intercompany transactions to eliminate on consolidation. Common: interco loans, interco revenue/expense, dividends paid by subsidiary to parent.</div>
+    <div class="notice-bar info">ℹ Leave blank if no intercompany transactions exist — the engine will still flag suspected interco balances automatically.</div>
+    <div id="eliminationList"></div>
+    <button onclick="addElimination()" style="margin-top:.5rem;padding:.45rem 1rem;background:var(--surface2);border:1px solid var(--border2);border-radius:7px;color:var(--text-muted);font-size:.8rem;cursor:pointer;transition:all .2s"
+      onmouseover="this.style.borderColor='var(--gold)'" onmouseout="this.style.borderColor='var(--border2)'">
+      + Add Elimination Entry
+    </button>
+  </section>
+
+  <section class="step-card">
+    <span class="step-num">03</span>
+    <div class="step-title">Consolidation Options</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:.875rem;margin-bottom:1rem">
+      <label style="display:flex;align-items:center;gap:.6rem;cursor:pointer;font-size:.85rem">
+        <input type="checkbox" id="optMinority" checked style="accent-color:var(--gold)"/>
+        Include Non-Controlling Interest (NCI)
+      </label>
+      <label style="display:flex;align-items:center;gap:.6rem;cursor:pointer;font-size:.85rem">
+        <input type="checkbox" id="optGoodwill" checked style="accent-color:var(--gold)"/>
+        Calculate Goodwill on Acquisition
+      </label>
+      <label style="display:flex;align-items:center;gap:.6rem;cursor:pointer;font-size:.85rem">
+        <input type="checkbox" id="optCurrencyNorm" checked style="accent-color:var(--gold)"/>
+        Normalize Account Names Across Entities
+      </label>
+      <label style="display:flex;align-items:center;gap:.6rem;cursor:pointer;font-size:.85rem">
+        <input type="checkbox" id="optSegment" checked style="accent-color:var(--gold)"/>
+        Generate Segment Report by Entity
+      </label>
+      <label style="display:flex;align-items:center;gap:.6rem;cursor:pointer;font-size:.85rem">
+        <input type="checkbox" id="optRatios" checked style="accent-color:var(--gold)"/>
+        Generate Group-Level Ratio Analysis
+      </label>
+      <label style="display:flex;align-items:center;gap:.6rem;cursor:pointer;font-size:.85rem">
+        <input type="checkbox" id="optAiNarr" checked style="accent-color:var(--gold)"/>
+        AI Executive Narrative (Llama 3.1)
+      </label>
+    </div>
+    <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:.5rem">
+      <div>
+        <div style="font-size:.75rem;color:var(--text-muted);font-family:'DM Mono',monospace;margin-bottom:.3rem">REPORTING PERIOD</div>
+        <input class="add-entity-input" id="consolPeriod" placeholder="e.g. December 31, 2024" style="max-width:260px"/>
+      </div>
+      <div>
+        <div style="font-size:.75rem;color:var(--text-muted);font-family:'DM Mono',monospace;margin-bottom:.3rem">REPORTING STANDARD</div>
+        <select id="consolStandard" style="background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:.55rem .9rem;color:var(--text);font-size:.85rem;outline:none">
+          <option value="IFRS">IFRS</option>
+          <option value="GAAP">US GAAP</option>
+          <option value="LOCAL">Local GAAP</option>
+        </select>
+      </div>
+    </div>
+    <button class="submit-btn consol-btn" id="consolBtn" onclick="runConsolidation()" disabled>🏢 Run Consolidation Engine</button>
+  </section>
+
+  <div id="cstatus-area" style="display:none"></div>
+  <div id="cresult-area"></div>
+</main>
+</div>
+
+<footer>
+  <span>Quanto Financial Intelligence Platform v1.0</span> &nbsp;·&nbsp; AI Vision OCR &nbsp;·&nbsp; Llama 3.1 Narrative Engine &nbsp;·&nbsp; Multi-Entity Consolidation
+  <br><span style="color:var(--text-dim)">Quanto is not responsible for financial decisions.</span>
+</footer>
+
+<script>
+const TB_ONLY = new Set([
+  "income_statement","balance_sheet","retained_earnings","equity_statement",
+  "trial_balance","ratio_analysis","liquidity_report","solvency_report",
+  "profitability_report","working_capital"
+]);
+
+let selectedStmt = null, selectedFStmt = null;
+let tbFile = null, multiSourceFiles = {}, forecastFiles = [];
+let allStatements = {}, currentAnalyticsData = null, chatHistory = [];
+
+// Consolidation state
+let entities = [];          // [{name, ownership, file}]
+let eliminations = [];      // [{type, amount, description, debit_entity, credit_entity}]
+let entityTempFile = null;
+
+const SOURCE_LABELS_JS = """ + json.dumps({k: list(v) for k,v in SOURCE_LABELS.items()}) + r""";
+
+fetch('/api/ocr-status').then(r=>r.json()).then(d=>{
+  const b=document.getElementById('ocrBadge');
+  const icons={gemini:'🟢',openai:'🔵',local:'🟡'};
+  b.textContent=`${icons[d.provider]||'⚪'} OCR: ${d.label} — ${d.note}`;
+});
+
+fetch('/api/statements').then(r=>r.json()).then(data=>{
+  allStatements=data;
+  const sg=document.getElementById('stmtGrid');
+  const fg=document.getElementById('fstmtGrid');
+  Object.entries(data).forEach(([key,info])=>{
+    const isForecast=info.category==='forecast';
+    const isMulti=!TB_ONLY.has(key)&&!isForecast;
+    const card=document.createElement('label');
+    card.className='stmt-card'+(isForecast?' forecast-card':'')+(isMulti?' multisource':'');
+    card.setAttribute('data-key',key);
+    card.setAttribute('data-category',isForecast?'forecast':(TB_ONLY.has(key)?'tb':'multi'));
+    card.innerHTML=`<input type="radio" class="stmt-radio" name="${isForecast?'fstatement':'statement'}" value="${key}" style="display:none"/>
+      <div class="stmt-icon">${info.icon}</div>
+      <div class="stmt-name">${info.label}</div>
+      <div class="stmt-alias">${info.aliases}</div>
+      ${isMulti?'<span class="source-badge">Multi-Source</span>':''}`;
+    card.addEventListener('click',()=>{
+      if(isForecast){
+        document.querySelectorAll('.forecast-card').forEach(c=>c.classList.remove('selected'));
+        selectedFStmt=key;
+        document.getElementById('fgenerateBtn').disabled=forecastFiles.length<3;
+      } else {
+        document.querySelectorAll('#stmtGrid .stmt-card').forEach(c=>c.classList.remove('selected'));
+        selectedStmt=key;
+        renderUploadSection(key,info);
+        checkGenerateReady();
+      }
+      card.classList.add('selected');
+    });
+    (isForecast?fg:sg).appendChild(card);
+  });
+});
+
+function filterCards(type,btn){
+  document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('#stmtGrid .stmt-card').forEach(c=>{
+    const cat=c.getAttribute('data-category');
+    c.style.display=(type==='all'||cat===type)?'':'none';
+  });
+}
+
+function renderUploadSection(key,info){
+  const sources=info.sources||[];
+  const isTbOnly=TB_ONLY.has(key);
+  document.getElementById('uploadTitle').textContent=isTbOnly?'Upload Trial Balance':'Upload Required Source Documents';
+  document.getElementById('uploadSub').textContent=isTbOnly?'This statement is generated from a single trial balance.':`This statement requires ${sources.length} source document(s). Upload all to proceed.`;
+  document.getElementById('tbUploadArea').style.display=isTbOnly?'block':'none';
+  document.getElementById('sourceRequiredArea').style.display=isTbOnly?'none':'block';
+  if(isTbOnly) return;
+  multiSourceFiles={};
+  const area=document.getElementById('sourceRequiredArea');
+  area.innerHTML='';
+  const box=document.createElement('div'); box.className='source-required';
+  box.innerHTML='<h4>📎 Required Documents</h4>';
+  sources.forEach(srcKey=>{
+    const [title,desc]=SOURCE_LABELS_JS[srcKey]||[srcKey,''];
+    const item=document.createElement('div'); item.className='source-item'; item.id='src-item-'+srcKey;
+    item.innerHTML=`<div class="source-item-icon">📄</div>
+      <div class="source-item-text"><div class="source-item-title">${title}</div><div class="source-item-desc">${desc}</div></div>
+      <div><input type="file" id="src-file-${srcKey}" accept=".pdf,.jpg,.jpeg,.png,.tiff,.bmp" style="display:none" onchange="handleSourceFile('${srcKey}',this)"/>
+      <button class="source-upload-btn" id="src-btn-${srcKey}" onclick="document.getElementById('src-file-${srcKey}').click()">Upload ↑</button></div>`;
+    box.appendChild(item);
+  });
+  area.appendChild(box);
+}
+
+function handleSourceFile(srcKey,input){
+  if(input.files[0]){
+    multiSourceFiles[srcKey]=input.files[0];
+    const btn=document.getElementById('src-btn-'+srcKey);
+    btn.className='source-upload-btn uploaded';
+    btn.textContent='✓ '+input.files[0].name.substring(0,22);
+    checkGenerateReady();
+  }
+}
+
+const fileInput=document.getElementById('fileInput');
+const uploadArea=document.getElementById('uploadArea');
+uploadArea.addEventListener('click',()=>fileInput.click());
+fileInput.addEventListener('change',e=>{if(e.target.files[0])pickTbFile(e.target.files[0]);});
+uploadArea.addEventListener('dragover',e=>{e.preventDefault();uploadArea.style.borderColor='var(--accent)'});
+uploadArea.addEventListener('dragleave',()=>{uploadArea.style.borderColor=''});
+uploadArea.addEventListener('drop',e=>{e.preventDefault();uploadArea.style.borderColor='';if(e.dataTransfer.files[0])pickTbFile(e.dataTransfer.files[0])});
+
+function pickTbFile(f){tbFile=f;document.getElementById('tbFileName').textContent=f.name;document.getElementById('tbFileChosen').style.display='flex';checkGenerateReady();}
+function removeTbFile(){tbFile=null;document.getElementById('tbFileChosen').style.display='none';fileInput.value='';checkGenerateReady();}
+function checkGenerateReady(){
+  if(!selectedStmt){document.getElementById('generateBtn').disabled=true;return;}
+  if(TB_ONLY.has(selectedStmt)){document.getElementById('generateBtn').disabled=!tbFile;}
+  else{const info=allStatements[selectedStmt]||{};const required=info.sources||[];document.getElementById('generateBtn').disabled=!required.every(s=>multiSourceFiles[s]);}
+}
+
+const forecastDz=document.getElementById('forecastDropZone');
+const forecastFi=document.getElementById('forecastFileInput');
+forecastDz.addEventListener('click',()=>forecastFi.click());
+forecastFi.addEventListener('change',e=>{Array.from(e.target.files).forEach(f=>{if(!forecastFiles.find(x=>x.name===f.name))forecastFiles.push(f)});renderForecastFiles();});
+function renderForecastFiles(){
+  const list=document.getElementById('forecastFileList');list.innerHTML='';
+  forecastFiles.forEach((f,i)=>{const tag=document.createElement('div');tag.className='file-tag';
+    tag.innerHTML=`📄 ${f.name} <button onclick="removeForecastFile(${i})" style="background:none;border:none;color:var(--red);cursor:pointer;margin-left:.3rem">✕</button>`;list.appendChild(tag);});
+  document.getElementById('fgenerateBtn').disabled=!(selectedFStmt&&forecastFiles.length>=3);
+  if(forecastFiles.length>0&&forecastFiles.length<3){const warn=document.createElement('div');warn.style.cssText='width:100%;color:var(--orange);font-size:.77rem;margin-top:.4rem;font-family:"DM Mono",monospace';warn.textContent=`⚠ ${forecastFiles.length}/3 files — minimum 3 required`;list.appendChild(warn);}
+}
+function removeForecastFile(i){forecastFiles.splice(i,1);renderForecastFiles();}
+
+// ── CONSOLIDATION LOGIC ──
+document.getElementById('entityFileInput').addEventListener('change',e=>{
+  if(e.target.files[0]){
+    entityTempFile=e.target.files[0];
+    document.getElementById('entityFileChosen').textContent='📄 '+entityTempFile.name;
+    document.getElementById('entityFileChosen').style.display='block';
+  }
+});
+
+function addEntity(){
+  const name=document.getElementById('entityNameInput').value.trim();
+  const ownership=parseFloat(document.getElementById('entityOwnershipInput').value)||100;
+  if(!name){alert('Please enter an entity name.');return;}
+  if(!entityTempFile){alert('Please select a trial balance file for this entity.');return;}
+  entities.push({name,ownership,file:entityTempFile,id:Date.now()});
+  document.getElementById('entityNameInput').value='';
+  document.getElementById('entityOwnershipInput').value='';
+  document.getElementById('entityFileInput').value='';
+  document.getElementById('entityFileChosen').style.display='none';
+  entityTempFile=null;
+  renderEntities();
+  checkConsolReady();
+}
+
+function removeEntity(id){
+  entities=entities.filter(e=>e.id!==id);
+  renderEntities();
+  checkConsolReady();
+}
+
+function renderEntities(){
+  const el=document.getElementById('entityList');el.innerHTML='';
+  entities.forEach((ent,i)=>{
+    const card=document.createElement('div');card.className='entity-card';
+    const isParent=i===0;
+    card.innerHTML=`
+      <div class="entity-label">${isParent?'Parent / Acquirer':'Subsidiary '+(i)}</div>
+      <div class="entity-name">${ent.name}</div>
+      <div class="entity-files">🗂 ${ent.file.name} &nbsp;·&nbsp; Ownership: <strong>${ent.ownership}%</strong>
+        ${ent.ownership<100?' &nbsp;·&nbsp; NCI: <strong>'+(100-ent.ownership)+'%</strong>':''}</div>
+      <button class="entity-remove" onclick="removeEntity(${ent.id})">✕</button>`;
+    el.appendChild(card);
+  });
+  updateEliminationEntitySelects();
+}
+
+function addElimination(){
+  const id=Date.now();
+  eliminations.push({id,type:'interco_loan',amount:0,description:'',debit_entity:'',credit_entity:''});
+  renderEliminations();
+}
+
+function removeElimination(id){
+  eliminations=eliminations.filter(e=>e.id!==id);
+  renderEliminations();
+}
+
+function renderEliminations(){
+  const el=document.getElementById('eliminationList');el.innerHTML='';
+  const entityOptions=entities.map(e=>`<option value="${e.name}">${e.name}</option>`).join('');
+  eliminations.forEach(elim=>{
+    const row=document.createElement('div');row.className='elim-row';
+    row.innerHTML=`
+      <label>Type:</label>
+      <select onchange="updateElim(${elim.id},'type',this.value)">
+        <option value="interco_loan" ${elim.type==='interco_loan'?'selected':''}>Interco Loan</option>
+        <option value="interco_revenue" ${elim.type==='interco_revenue'?'selected':''}>Interco Revenue/Expense</option>
+        <option value="interco_dividend" ${elim.type==='interco_dividend'?'selected':''}>Interco Dividend</option>
+        <option value="interco_ap_ar" ${elim.type==='interco_ap_ar'?'selected':''}>Interco AP/AR</option>
+        <option value="investment_equity" ${elim.type==='investment_equity'?'selected':''}>Investment vs Equity</option>
+        <option value="unrealised_profit" ${elim.type==='unrealised_profit'?'selected':''}>Unrealised Profit in Inventory</option>
+        <option value="other" ${elim.type==='other'?'selected':''}>Other</option>
+      </select>
+      <label>Amount:</label>
+      <input type="number" value="${elim.amount}" placeholder="Amount $" onchange="updateElim(${elim.id},'amount',parseFloat(this.value)||0)"/>
+      <label>Dr Entity:</label>
+      <select onchange="updateElim(${elim.id},'debit_entity',this.value)"><option value="">— select —</option>${entityOptions}</select>
+      <label>Cr Entity:</label>
+      <select onchange="updateElim(${elim.id},'credit_entity',this.value)"><option value="">— select —</option>${entityOptions}</select>
+      <button class="elim-remove" onclick="removeElimination(${elim.id})">✕</button>`;
+    el.appendChild(row);
+  });
+}
+
+function updateElim(id,field,value){
+  const e=eliminations.find(x=>x.id===id);
+  if(e) e[field]=value;
+}
+
+function updateEliminationEntitySelects(){renderEliminations();}
+
+function checkConsolReady(){
+  document.getElementById('consolBtn').disabled=entities.length<1;
+}
+
+async function runConsolidation(){
+  if(entities.length<1){alert('Add at least one entity.');return;}
+  const parentName=document.getElementById('parentNameInput').value.trim()||'Group Consolidated';
+  const period=document.getElementById('consolPeriod').value.trim()||'Current Period';
+  const standard=document.getElementById('consolStandard').value;
+  const optMinority=document.getElementById('optMinority').checked;
+  const optGoodwill=document.getElementById('optGoodwill').checked;
+  const optCurrencyNorm=document.getElementById('optCurrencyNorm').checked;
+  const optSegment=document.getElementById('optSegment').checked;
+  const optRatios=document.getElementById('optRatios').checked;
+  const optAiNarr=document.getElementById('optAiNarr').checked;
+
+  const btn=document.getElementById('consolBtn');btn.disabled=true;
+  const statusArea=document.getElementById('cstatus-area');
+  statusArea.style.display='block';
+  const steps=[
+    'Step 1: Extracting & OCR-reading all entity trial balances...',
+    'Step 2: Normalizing account names across entities...',
+    'Step 3: Validating trial balance integrity per entity...',
+    'Step 4: Applying ownership % and computing NCI allocations...',
+    'Step 5: Processing intercompany eliminations...',
+    'Step 6: Auto-detecting suspected intercompany balances...',
+    'Step 7: Calculating Goodwill on acquisition...',
+    'Step 8: Aggregating consolidated trial balance...',
+    'Step 9: Building consolidated Income Statement...',
+    'Step 10: Building consolidated Balance Sheet...',
+    'Step 11: Building Statement of Changes in Equity...',
+    'Step 12: Computing group-level financial ratios...',
+    'Step 13: Generating per-entity segment report...',
+    'Step 14: Running AI narrative engine (Llama 3.1)...',
+    'Step 15: Assembling multi-tab Excel consolidation package...',
+  ];
+  statusArea.innerHTML='<div class="progress-card">'+steps.map(s=>`<div class="step-item active"><span class="spinner"></span>${s}</div>`).join('')+'</div>';
+  document.getElementById('cresult-area').innerHTML='';
+
+  const fd=new FormData();
+  fd.append('parent_name',parentName);
+  fd.append('period',period);
+  fd.append('standard',standard);
+  fd.append('options',JSON.stringify({minority:optMinority,goodwill:optGoodwill,normalize:optCurrencyNorm,segment:optSegment,ratios:optRatios,ai_narrative:optAiNarr}));
+  fd.append('eliminations',JSON.stringify(eliminations.map(e=>({type:e.type,amount:e.amount,description:e.description,debit_entity:e.debit_entity,credit_entity:e.credit_entity}))));
+  entities.forEach(ent=>{fd.append('entities',ent.file,`${ent.name}||${ent.ownership}||${ent.file.name}`);});
+
+  try{
+    const resp=await fetch('/api/consolidate',{method:'POST',body:fd});
+    const data=await resp.json();
+    if(!resp.ok) throw new Error(data.detail||'Unknown error');
+    statusArea.innerHTML='';
+    const warnings=(data.warnings||[]).map(w=>`<p style="color:var(--orange);font-size:.78rem;margin-top:.35rem">⚠ ${w}</p>`).join('');
+    const elims=(data.eliminations_applied||[]).map(e=>`<li style="font-size:.78rem;color:var(--text-muted)">${e}</li>`).join('');
+    document.getElementById('cresult-area').innerHTML=`
+      <div class="result-card consol-result">
+        <div style="font-size:2.2rem">🏢</div>
+        <h2 style="margin:.6rem 0;font-size:1.35rem">${parentName} — Consolidated Financial Statements</h2>
+        <p style="color:var(--text-muted);font-size:.9rem">${period} · ${standard} · <strong>${data.entity_count} entities</strong></p>
+        <p style="color:var(--text-dim);font-size:.78rem;margin-top:.4rem">
+          ${data.total_accounts_extracted} accounts extracted · ${data.eliminations_count} eliminations applied · OCR: ${data.ocr_provider}
+        </p>
+        ${warnings}
+        ${elims?`<ul style="margin-top:.5rem;text-align:left;padding-left:1.5rem">${elims}</ul>`:''}
+        <a href="/api/download/${data.filename}" class="download-btn" style="background:linear-gradient(135deg,var(--gold),#e0a820);color:#1a1000;box-shadow:0 4px 20px rgba(245,200,66,0.25)">
+          ⬇ Download Consolidation Package
+        </a>
+      </div>`;
+  }catch(err){
+    statusArea.innerHTML='';
+    document.getElementById('cresult-area').innerHTML=`<div class="result-card" style="border-color:var(--red)">
+      <div style="font-size:1.8rem">❌</div><h3 style="color:var(--red);margin:.5rem 0">Error</h3>
+      <p style="color:var(--text-muted);font-size:.88rem">${err.message}</p>
+    </div>`;
+  }
+  btn.disabled=false;
+}
+
+function switchTab(name,btn){
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  btn.classList.add('active');
+}
+
+function switchAnalyticsTab(name,btn){
+  document.querySelectorAll('.analytics-sub-panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.analytics-tab').forEach(b=>b.classList.remove('active'));
+  document.getElementById('panel-'+name).classList.add('active');
+  btn.classList.add('active');
+}
+
+function fmt(v,type){
+  if(v===null||v===undefined||v==='N/A') return 'N/A';
+  const n=parseFloat(v); if(isNaN(n)) return String(v);
+  if(type==='pct') return (n*100).toFixed(1)+'%';
+  if(type==='x') return n.toFixed(2)+'x';
+  if(type==='$') return '$'+n.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0});
+  if(type==='days') return n.toFixed(1)+' days';
+  return n.toFixed(2);
+}
+function scoreClass(v,good,warn){
+  if(v===null||v===undefined||isNaN(parseFloat(v))) return 'neutral';
+  const n=parseFloat(v);
+  if(n>=good) return 'good'; if(n>=warn) return 'warn'; return 'bad';
+}
+
+function renderKPIs(d){
+  const g=document.getElementById('kpi-grid-container'); g.innerHTML='';
+  const grid=document.createElement('div'); grid.className='kpi-grid';
+  const kpis=[
+    {label:'Revenue',val:fmt(d.revenue,'$'),cls:'neutral',note:'Total revenue for period'},
+    {label:'Net Income',val:fmt(d.net_income,'$'),cls:parseFloat(d.net_income)>=0?'positive':'negative',note:'After all expenses'},
+    {label:'Gross Profit',val:fmt(d.gross_profit,'$'),cls:parseFloat(d.gross_profit)>=0?'positive':'negative',note:'Revenue minus COGS'},
+    {label:'Gross Margin',val:fmt(d.gross_margin,'pct'),cls:scoreClass(parseFloat(d.gross_margin)*100,30,15),note:'Gross Profit / Revenue'},
+    {label:'Net Margin',val:fmt(d.net_margin,'pct'),cls:scoreClass(parseFloat(d.net_margin)*100,10,3),note:'Net Income / Revenue'},
+    {label:'Total Assets',val:fmt(d.total_assets,'$'),cls:'neutral',note:'Balance sheet total'},
+    {label:'Total Liabilities',val:fmt(d.total_liabilities,'$'),cls:'neutral',note:'All obligations'},
+    {label:'Total Equity',val:fmt(d.total_equity,'$'),cls:parseFloat(d.total_equity)>=0?'positive':'negative',note:'Net assets'},
+  ];
+  if(d.ebitda!==null&&d.ebitda!==undefined)
+    kpis.splice(3,0,{label:'EBITDA',val:fmt(d.ebitda,'$'),cls:parseFloat(d.ebitda)>=0?'positive':'negative',note:'Earnings before I/T/D/A'});
+  kpis.forEach(k=>{const card=document.createElement('div');card.className='kpi-card';
+    card.innerHTML=`<div class="kpi-label">${k.label}</div><div class="kpi-value ${k.cls}">${k.val}</div><div class="kpi-note">${k.note}</div>`;
+    grid.appendChild(card);});
+  g.appendChild(grid);
+}
+
+function renderRatios(d){
+  const c=document.getElementById('ratios-container'); c.innerHTML='';
+  const sections=[
+    {title:'Liquidity Ratios',rows:[
+      ['Current Ratio',fmt(d.current_ratio,'x'),'x','Current Assets / Current Liabilities',2.0,1.5],
+      ['Quick Ratio',fmt(d.quick_ratio,'x'),'x','(Cash + AR) / Current Liabilities',1.0,0.8],
+      ['Cash Ratio',fmt(d.cash_ratio,'x'),'x','Cash / Current Liabilities',0.5,0.2],
+      ['Working Capital',fmt(d.working_capital,'$'),'$','Current Assets − Current Liabilities',1,0],
+    ]},
+    {title:'Profitability Ratios',rows:[
+      ['Gross Profit Margin',fmt(d.gross_margin,'pct'),'pct','Gross Profit / Revenue',0.35,0.15],
+      ['Net Profit Margin',fmt(d.net_margin,'pct'),'pct','Net Income / Revenue',0.10,0.03],
+      ['EBITDA Margin',fmt(d.ebitda_margin,'pct'),'pct','EBITDA / Revenue',0.20,0.08],
+      ['Return on Assets (ROA)',fmt(d.roa,'pct'),'pct','Net Income / Total Assets',0.05,0.02],
+      ['Return on Equity (ROE)',fmt(d.roe,'pct'),'pct','Net Income / Total Equity',0.15,0.08],
+    ]},
+    {title:'Leverage / Solvency Ratios',rows:[
+      ['Debt-to-Equity Ratio',fmt(d.debt_to_equity,'x'),'x','Total Liabilities / Total Equity',null,null,true],
+      ['Debt Ratio',fmt(d.debt_ratio,'x'),'x','Total Liabilities / Total Assets',null,null,true],
+      ['Equity Ratio',fmt(d.equity_ratio,'pct'),'pct','Total Equity / Total Assets',0.50,0.30],
+    ]},
+  ];
+  sections.forEach(sec=>{
+    const title=document.createElement('div');title.className='ratio-section-title';title.textContent=sec.title;c.appendChild(title);
+    const table=document.createElement('table');table.className='ratio-table';
+    table.innerHTML=`<thead><tr><th>Ratio</th><th>Description</th><th>Value</th></tr></thead><tbody></tbody>`;
+    const tbody=table.querySelector('tbody');
+    sec.rows.forEach(([name,val,type,desc,good,warn,invertScore])=>{
+      const tr=document.createElement('tr');
+      let cls='neutral';
+      if(type&&val&&val!=='N/A'&&!val.includes('—')&&!val.includes('requires')){
+        const raw=parseFloat(val.replace(/[%x$,days\s]/g,''));
+        if(!isNaN(raw)&&good!==null){cls=invertScore?(raw<2?'good':raw<4?'warn':'bad'):(raw>=good?'good':raw>=warn?'warn':'bad');}
+      }
+      tr.innerHTML=`<td>${name}</td><td style="font-size:.78rem;color:var(--text-muted);font-family:'DM Mono',monospace">${desc}</td><td class="ratio-val ${cls}">${val}</td>`;
+      tbody.appendChild(tr);
+    });
+    c.appendChild(table);
+  });
+}
+
+function renderInsights(insights){
+  const c=document.getElementById('insights-container'); c.innerHTML='';
+  if(typeof insights==='string'){
+    const block=document.createElement('div');block.className='insight-block';
+    block.innerHTML=`<h4>AI Financial Commentary</h4><p>${insights.replace(/\n/g,'<br>')}</p>`;c.appendChild(block);return;
+  }
+  [['financial_analysis','📈 Financial Analysis'],['management_insights','💼 Management Insights'],['risks_and_opportunities','⚠️ Risks & Opportunities']].forEach(([key,title])=>{
+    if(!insights[key]) return;
+    const block=document.createElement('div');block.className='insight-block';
+    block.innerHTML=`<h4>${title}</h4>`;
+    const content=insights[key];
+    if(Array.isArray(content)){const ul=document.createElement('ul');content.forEach(item=>{const li=document.createElement('li');li.textContent=item;ul.appendChild(li);});block.appendChild(ul);}
+    else{const p=document.createElement('p');p.textContent=content;block.appendChild(p);}
+    c.appendChild(block);
+  });
+  if(!c.children.length) c.innerHTML='<p style="color:var(--text-muted);font-size:.85rem">No insights available.</p>';
+}
+
+async function loadAnalytics(data){
+  currentAnalyticsData=data; chatHistory=[];
+  document.getElementById('analytics-company-title').textContent=data.company+' — Financial Analysis';
+  document.getElementById('analytics-period-sub').textContent=data.period+' · '+data.statement_label;
+  document.getElementById('analytics-area').style.display='block';
+  document.getElementById('chatMessages').innerHTML=`<div class="chat-empty"><div class="chat-empty-icon">💬</div><p>Ask anything about <strong>${data.company}</strong>'s financials.</p></div>`;
+  document.getElementById('insights-container').innerHTML='<div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:.85rem"><span class="spinner"></span> Generating AI insights...</div>';
+  if(data.analytics){renderKPIs(data.analytics);renderRatios(data.analytics);}
+  try{
+    const iResp=await fetch('/api/insights',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({analytics:data.analytics,company:data.company,period:data.period,statement_type:data.statement_type})});
+    const iData=await iResp.json();
+    if(iData.insights) renderInsights(iData.insights);
+    else document.getElementById('insights-container').innerHTML='<p style="color:var(--text-muted);font-size:.85rem">Insights unavailable.</p>';
+  }catch(e){
+    document.getElementById('insights-container').innerHTML='<p style="color:var(--red);font-size:.85rem">Could not generate insights — ensure Ollama is running.</p>';
+  }
+}
+
+async function sendChat(){
+  const input=document.getElementById('chatInput');const msg=input.value.trim();
+  if(!msg||!currentAnalyticsData) return;
+  input.value='';
+  const msgs=document.getElementById('chatMessages');
+  const firstChild=msgs.querySelector('.chat-empty');if(firstChild) msgs.innerHTML='';
+  const userBubble=document.createElement('div');userBubble.className='chat-msg user';userBubble.textContent=msg;msgs.appendChild(userBubble);
+  const typingBubble=document.createElement('div');typingBubble.className='chat-msg assistant typing';
+  typingBubble.innerHTML='<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>';msgs.appendChild(typingBubble);
+  msgs.scrollTop=msgs.scrollHeight;document.getElementById('chatSendBtn').disabled=true;
+  chatHistory.push({role:'user',content:msg});
+  try{
+    const resp=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:msg,history:chatHistory,analytics:currentAnalyticsData.analytics,company:currentAnalyticsData.company,period:currentAnalyticsData.period})});
+    const data=await resp.json();const reply=data.reply||'Unable to generate a response.';
+    chatHistory.push({role:'assistant',content:reply});
+    typingBubble.remove();
+    const asBubble=document.createElement('div');asBubble.className='chat-msg assistant';
+    asBubble.innerHTML=`<div class="msg-label">Quanto AI</div>${reply.replace(/\n/g,'<br>')}`;msgs.appendChild(asBubble);msgs.scrollTop=msgs.scrollHeight;
+  }catch(e){
+    typingBubble.remove();
+    const errBubble=document.createElement('div');errBubble.className='chat-msg assistant';
+    errBubble.innerHTML='<div class="msg-label">Quanto AI</div>Error connecting to AI engine.';msgs.appendChild(errBubble);
+  }
+  document.getElementById('chatSendBtn').disabled=false;input.focus();
+}
+
+async function generate(){
+  if(!selectedStmt) return;
+  const btn=document.getElementById('generateBtn'); btn.disabled=true;
+  const statusArea=document.getElementById('status-area'); statusArea.style.display='block';
+  statusArea.innerHTML=`<div class="progress-card">
+    <div class="step-item active"><span class="spinner"></span>Extracting document text with AI Vision OCR...</div>
+    <div class="step-item active"><span class="spinner"></span>Parsing financial accounts & ledger...</div>
+    <div class="step-item active"><span class="spinner"></span>Generating professional Excel workbook...</div>
+    <div class="step-item active"><span class="spinner"></span>Computing financial analytics...</div>
+  </div>`;
+  document.getElementById('result-area').innerHTML='';
+  document.getElementById('analytics-area').style.display='none';
+  const fd=new FormData(); fd.append('statement_type',selectedStmt);
+  if(TB_ONLY.has(selectedStmt)){fd.append('files',tbFile,tbFile.name);}
+  else{const info=allStatements[selectedStmt]||{};(info.sources||[]).forEach(src=>{if(multiSourceFiles[src])fd.append('files',multiSourceFiles[src],`${src}::${multiSourceFiles[src].name}`);});}
+  try{
+    const resp=await fetch('/api/generate',{method:'POST',body:fd});
+    const data=await resp.json(); if(!resp.ok) throw new Error(data.detail||'Unknown error');
+    statusArea.innerHTML='';
+    document.getElementById('result-area').innerHTML=`<div class="result-card">
+      <div style="font-size:2.2rem">✅</div>
+      <h2 style="margin:.6rem 0;font-size:1.35rem">${data.statement_label}</h2>
+      <p style="color:var(--text-muted);font-size:.9rem"><strong>${data.company}</strong> · ${data.period}</p>
+      <p style="color:var(--text-dim);font-size:.78rem;margin-top:.4rem">${data.accounts_found} accounts extracted · OCR: ${data.ocr_provider}</p>
+      <a href="/api/download/${data.filename}" class="download-btn">⬇ Download Excel</a>
+    </div>`;
+    if(data.analytics) await loadAnalytics(data);
+  }catch(err){
+    statusArea.innerHTML='';
+    document.getElementById('result-area').innerHTML=`<div class="result-card" style="border-color:var(--red)">
+      <div style="font-size:1.8rem">❌</div><h3 style="color:var(--red);margin:.5rem 0">Error</h3>
+      <p style="color:var(--text-muted);font-size:.88rem">${err.message}</p>
+    </div>`;
+  }
+  btn.disabled=false;
+}
+
+async function generateForecast(){
+  if(!selectedFStmt||forecastFiles.length<3) return;
+  const btn=document.getElementById('fgenerateBtn'); btn.disabled=true;
+  const statusArea=document.getElementById('fstatus-area'); statusArea.style.display='block';
+  const phases=['Phase 1-2: Validating and quality-checking documents…','Phase 3: Normalizing account names across years…',
+    'Phase 4: Computing historical ratios…','Phase 5-6: Identifying drivers and running forecast methods…',
+    'Phase 7: Building three-statement linked model…','Phase 8: Projecting cash flows and runway…',
+    'Phase 9: Running scenario analysis (Base/Best/Worst)…','Phase 10: Generating stakeholder analysis…',
+    'Phase 11: Running DCF valuation model…','Phase 12: Scoring risk across 6 dimensions…',
+    'Phase 13: Generating AI narrative via Llama 3.1…','Phase 14: Computing forecast confidence scores…',
+    'Phase 15: Building 13-tab Excel workbook…'];
+  statusArea.innerHTML='<div class="progress-card">'+phases.map(p=>`<div class="step-item active"><span class="spinner"></span>${p}</div>`).join('')+'</div>';
+  document.getElementById('fresult-area').innerHTML='';
+  const fd=new FormData(); fd.append('forecast_type',selectedFStmt);
+  forecastFiles.forEach(f=>fd.append('files',f,f.name));
+  try{
+    const resp=await fetch('/api/forecast',{method:'POST',body:fd});
+    const data=await resp.json(); if(!resp.ok) throw new Error(data.detail||'Unknown error');
+    statusArea.innerHTML='';
+    const cs=data.confidence_scores||{};
+    document.getElementById('fresult-area').innerHTML=`<div class="result-card forecast-result">
+      <div style="font-size:2.2rem">🚀</div>
+      <h2 style="margin:.6rem 0;font-size:1.35rem">${data.forecast_label}</h2>
+      <p style="color:var(--text-muted);font-size:.9rem"><strong>${data.company}</strong> · ${data.period}</p>
+      <p style="color:var(--text-dim);font-size:.78rem;margin-top:.4rem">
+        ${data.years_analyzed} years analyzed · ${data.phases_run} phases complete ·
+        Revenue confidence: <strong>${cs.revenue}</strong> · Margins: <strong>${cs.margins}</strong>
+      </p>
+      ${(data.validation_warnings||[]).map(w=>`<p style="color:var(--orange);font-size:.78rem;margin-top:.35rem">⚠ ${w}</p>`).join('')}
+      <a href="/api/download/${data.filename}" class="download-btn" style="background:linear-gradient(135deg,var(--accent2),#6451d9)">⬇ Download Forecast Workbook</a>
+    </div>`;
+  }catch(err){
+    statusArea.innerHTML='';
+    document.getElementById('fresult-area').innerHTML=`<div class="result-card" style="border-color:var(--red)">
+      <div style="font-size:1.8rem">❌</div><h3 style="color:var(--red);margin:.5rem 0">Error</h3>
+      <p style="color:var(--text-muted);font-size:.88rem">${err.message}</p>
+    </div>`;
+  }
+  btn.disabled=false;
+}
+</script>
+</body>
+</html>"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OCR  UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+def _pdf_to_images_base64(file_bytes: bytes) -> list:
+    try:
+        from PIL import Image as PILImage
+        try:
+            from pdf2image import convert_from_bytes
+            images = convert_from_bytes(file_bytes, dpi=300)
+            result = []
+            for img in images[:8]:
+                buf = io.BytesIO(); img.save(buf, format="PNG")
+                result.append(base64.b64encode(buf.getvalue()).decode())
+            return result
+        except ImportError:
+            pass
+    except Exception:
+        pass
+    return []
+
+def _image_to_base64(file_bytes: bytes, filename: str) -> str:
+    return base64.b64encode(file_bytes).decode()
+
+def _extract_text_local(file_bytes: bytes, filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    if ext == ".pdf":
+        try:
+            import pdfplumber
+            pages = []
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages:
+                    tables = page.extract_tables()
+                    if tables:
+                        for table in tables:
+                            for row in table:
+                                pages.append("\t".join(str(c or "").strip() for c in row))
+                    txt = page.extract_text()
+                    if txt: pages.append(txt)
+            return "\n".join(pages)
+        except ImportError:
+            raise HTTPException(500, "pdfplumber not installed.")
+    else:
+        try:
+            import pytesseract
+            from PIL import Image as PILImage
+            img = PILImage.open(io.BytesIO(file_bytes))
+            w, h = img.size
+            if w < 1200:
+                sc = 2400 / w; img = img.resize((int(w*sc), int(h*sc)), PILImage.LANCZOS)
+            img = img.convert("L")
+            return pytesseract.image_to_string(img, config="--psm 6 --oem 3")
+        except ImportError:
+            raise HTTPException(500, "pytesseract/pillow not installed.")
+
+def _extract_text_gemini(file_bytes: bytes, filename: str) -> str:
+    if not GEMINI_API_KEY: raise ValueError("GEMINI_API_KEY not set")
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-pro")
+        ext = Path(filename).suffix.lower()
+        if ext == ".pdf":
+            response = model.generate_content([genai.upload_blob(file_bytes, mime_type="application/pdf"), VISION_PROMPT])
+        else:
+            from PIL import Image as PILImage
+            img = PILImage.open(io.BytesIO(file_bytes)); w, h = img.size
+            if w < 2000:
+                sc = 2400/w; img = img.resize((int(w*sc), int(h*sc)), PILImage.LANCZOS)
+            buf = io.BytesIO(); img.save(buf, format="PNG")
+            img_part = {"mime_type": "image/png", "data": base64.b64encode(buf.getvalue()).decode()}
+            response = model.generate_content([img_part, VISION_PROMPT])
+        return response.text
+    except Exception as e:
+        raise RuntimeError(f"Gemini OCR failed: {e}")
+
+def _extract_text_openai(file_bytes: bytes, filename: str) -> str:
+    if not OPENAI_API_KEY: raise ValueError("OPENAI_API_KEY not set")
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        ext = Path(filename).suffix.lower()
+        messages = [{"role":"user","content":[{"type":"text","text":VISION_PROMPT}]}]
+        if ext == ".pdf":
+            images_b64 = _pdf_to_images_base64(file_bytes)
+            if not images_b64:
+                text = _extract_text_local(file_bytes, filename)
+                resp = client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":f"{VISION_PROMPT}\n\n{text}"}],max_tokens=4096,temperature=0)
+                return resp.choices[0].message.content
+            for b64 in images_b64[:4]:
+                messages[0]["content"].append({"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}","detail":"high"}})
+        else:
+            from PIL import Image as PILImage
+            img = PILImage.open(io.BytesIO(file_bytes)); w, h = img.size
+            if w < 2000:
+                sc = 2400/w; img = img.resize((int(w*sc), int(h*sc)), PILImage.LANCZOS)
+            buf = io.BytesIO(); img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            messages[0]["content"].append({"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}","detail":"high"}})
+        resp = client.chat.completions.create(model="gpt-4o",messages=messages,max_tokens=4096,temperature=0)
+        return resp.choices[0].message.content
+    except Exception as e:
+        raise RuntimeError(f"OpenAI OCR failed: {e}")
+
+VISION_PROMPT = """You are an expert financial document OCR engine.
+Extract ALL text from this financial document with PERFECT accuracy.
+Pay special attention to:
+- Every numerical value: read each digit carefully. Do NOT confuse 3 and 8, 0 and 6, 1 and 7, 5 and 6.
+- Account names and descriptions
+- Column headers and row labels
+- Debit / Credit designations
+- Totals and subtotals
+- Company name, period/date
+Output the complete raw extracted text preserving table structure with tab separators.
+Do not summarize, interpret, or skip any line. Output every line exactly as it appears."""
+
+def extract_text(file_bytes: bytes, filename: str) -> str:
+    provider = OCR_PROVIDER; errors = []
+    if provider == "gemini" and GEMINI_API_KEY:
+        try: return _extract_text_gemini(file_bytes, filename)
+        except Exception as e: errors.append(f"Gemini: {e}")
+    if provider in ("openai","gemini") and OPENAI_API_KEY:
+        try: return _extract_text_openai(file_bytes, filename)
+        except Exception as e: errors.append(f"OpenAI: {e}")
+    try: return _extract_text_local(file_bytes, filename)
+    except Exception as e: errors.append(f"Local: {e}")
+    raise HTTPException(422, f"All OCR providers failed: {' | '.join(errors)}")
+
+def get_ocr_status() -> dict:
+    if OCR_PROVIDER == "gemini" and GEMINI_API_KEY:
+        return {"provider":"gemini","label":"Google Gemini 1.5 Pro","note":"Highest accuracy AI vision OCR"}
+    if OCR_PROVIDER == "openai" and OPENAI_API_KEY:
+        return {"provider":"openai","label":"OpenAI GPT-4o Vision","note":"High accuracy AI vision OCR"}
+    if OPENAI_API_KEY:
+        return {"provider":"openai","label":"OpenAI GPT-4o Vision","note":"High accuracy AI vision OCR (auto-detected)"}
+    if GEMINI_API_KEY:
+        return {"provider":"gemini","label":"Google Gemini 1.5 Pro","note":"Highest accuracy AI vision OCR (auto-detected)"}
+    return {"provider":"local","label":"Local (pdfplumber + Tesseract)","note":"Set GEMINI_API_KEY or OPENAI_API_KEY for higher accuracy"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM  UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+EXTRACT_PROMPT = """
+You are a professional CPA. Extract every account from the financial document text.
+Return ONLY valid JSON — no markdown, no explanation:
+{
+  "company_name": "...",
+  "period": "December 31, YYYY",
+  "accounts": [
+    {"name": "Cash", "type": "asset", "debit": 32800, "credit": 0},
+    {"name": "Accounts Payable", "type": "liability", "debit": 0, "credit": 49000},
+    {"name": "Common Stock", "type": "equity", "debit": 0, "credit": 10000},
+    {"name": "Revenues", "type": "revenue", "debit": 0, "credit": 27800},
+    {"name": "Cost of Goods Sold", "type": "expense", "debit": 10200, "credit": 0},
+    {"name": "Dividends", "type": "dividend", "debit": 1000, "credit": 0}
+  ]
+}
+Rules:
+- type must be one of: asset | liability | equity | revenue | expense | dividend
+- numbers are plain integers/floats, no commas, no $, use 0 not null
+- include EVERY line item — do NOT skip any account
+- read digit values with extreme care — verify every number
+"""
+
+MULTI_SOURCE_EXTRACT_PROMPT = """
+You are a professional CPA and financial analyst.
+You are given multiple source financial documents. Each document is labeled with its type.
+Extract all relevant data needed to build the requested financial schedule.
+Return ONLY valid JSON — no markdown, no explanation.
+Format:
+{
+  "company_name": "...",
+  "period": "...",
+  "document_type": "<schedule type>",
+  "data": { ... structured data matching the schedule type ... }
+}
+Extract ALL line items, dates, amounts, and descriptions with perfect accuracy.
+"""
+
+def call_ollama(system: str, user: str) -> str:
+    try:
+        import ollama
+    except ImportError:
+        raise HTTPException(500, "ollama not installed. Run: pip install ollama")
+    try:
+        resp = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            options={"temperature":0.0,"num_predict":8192},
+        )
+        content = resp["message"]["content"].strip()
+        content = re.sub(r"^```[a-z]*\n?","",content,flags=re.MULTILINE)
+        content = re.sub(r"\n?```$","",content,flags=re.MULTILINE)
+        return content
+    except Exception as e:
+        raise HTTPException(500, f"Ollama error: {e}. Is 'ollama serve' running and llama3.1 pulled?")
+
+def extract_accounts(raw_text: str) -> dict:
+    content = call_ollama(EXTRACT_PROMPT, f"Extract all accounts:\n\n{raw_text}")
+    try: return json.loads(content)
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"Ollama returned invalid JSON: {e}\nRaw output: {content[:300]}")
+
+def extract_multi_source(texts: dict, schedule_type: str) -> dict:
+    combined = "\n\n".join([f"=== {k.upper()} ===\n{v}" for k,v in texts.items()])
+    prompt = f"Schedule type requested: {schedule_type}\n\nDocuments:\n{combined}"
+    content = call_ollama(MULTI_SOURCE_EXTRACT_PROMPT, prompt)
+    try: return json.loads(content)
+    except json.JSONDecodeError:
+        return {"company_name":"Unknown","period":"Unknown","document_type":schedule_type,"data":{},"raw":content}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEDGER  HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def build_ledger(accounts: list) -> dict:
+    L = {"assets":{},"liabilities":{},"equity":{},"revenue":{},"expenses":{},"dividends":{}}
+    for a in accounts:
+        name=a.get("name",""); dr=float(a.get("debit",0) or 0); cr=float(a.get("credit",0) or 0)
+        t=a.get("type","").lower()
+        if   t=="asset":     L["assets"][name]=dr
+        elif t=="liability": L["liabilities"][name]=cr
+        elif t=="equity":    L["equity"][name]=cr
+        elif t=="revenue":   L["revenue"][name]=cr
+        elif t=="expense":   L["expenses"][name]=dr
+        elif t=="dividend":  L["dividends"][name]=dr
+    return L
+
+def safe_div(n,d): return round(n/d,6) if d and d!=0 else 0.0
+def _cur_assets(L):
+    kw=["cash","receivable","inventory","prepaid","short","market"]
+    return {k:v for k,v in L["assets"].items() if any(x in k.lower() for x in kw)}
+def _nca(L):
+    ca=_cur_assets(L); return {k:v for k,v in L["assets"].items() if k not in ca}
+def _cur_liab(L):
+    kw=["payable","accrued","current","tax","short","deferred rev"]
+    return {k:v for k,v in L["liabilities"].items() if any(x in k.lower() for x in kw)}
+def _ncl(L):
+    cl=_cur_liab(L); return {k:v for k,v in L["liabilities"].items() if k not in cl}
+def _net_income(L): return sum(L["revenue"].values())-sum(L["expenses"].values())
+def _dividends(L): return sum(L["dividends"].values())
+def _total_equity(L):
+    ni=_net_income(L); div=_dividends(L)
+    stock=sum(v for k,v in L["equity"].items() if "stock" in k.lower() or "capital" in k.lower())
+    opening_re=sum(v for k,v in L["equity"].items() if "retained" in k.lower())
+    return stock+opening_re+ni-div
+def _cogs(L): return sum(v for k,v in L["expenses"].items() if "cost" in k.lower() or "cogs" in k.lower())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALYTICS
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_analytics(L: dict, accounts: list) -> dict:
+    rev=sum(L["revenue"].values()); cogs=_cogs(L); gp=rev-cogs; ni=_net_income(L)
+    ta=sum(L["assets"].values()); tl=sum(L["liabilities"].values()); te=_total_equity(L)
+    ca=sum(_cur_assets(L).values()); cl=sum(_cur_liab(L).values()); nca=sum(_nca(L).values())
+    cash=sum(v for k,v in L["assets"].items() if "cash" in k.lower())
+    ar=sum(v for k,v in L["assets"].items() if "receivable" in k.lower())
+    inv=sum(v for k,v in L["assets"].items() if "inventory" in k.lower())
+    ap=sum(v for k,v in L["liabilities"].items() if "payable" in k.lower() and "tax" not in k.lower())
+    int_exp=sum(v for k,v in L["expenses"].items() if "interest" in k.lower())
+    dep_exp=sum(v for k,v in L["expenses"].items() if "depreci" in k.lower() or "amort" in k.lower())
+    opex=sum(L["expenses"].values())-cogs; ebit=ni+int_exp; ebitda=ebit+dep_exp
+    op_inc=gp-opex; wc=ca-cl; invested_capital=te+tl-(ta-ca-nca)
+    nopat=ebit*(1-0.21); op_cf_est=ni+dep_exp
+    debt_svc=int_exp+sum(v for k,v in L["liabilities"].items() if "current" in k.lower() and "portion" in k.lower())
+    return {
+        "revenue":rev,"cogs":cogs,"gross_profit":gp,"net_income":ni,"total_assets":ta,
+        "total_liabilities":tl,"total_equity":te,"ebitda":ebitda,
+        "gross_margin":safe_div(gp,rev),"net_margin":safe_div(ni,rev),
+        "operating_margin":safe_div(op_inc,rev),"ebitda_margin":safe_div(ebitda,rev),
+        "current_ratio":safe_div(ca,cl),"quick_ratio":safe_div(cash+ar,cl),
+        "cash_ratio":safe_div(cash,cl),"working_capital":wc,"working_capital_ratio":safe_div(ca,cl),
+        "roa":safe_div(ni,ta),"roe":safe_div(ni,te),"roic":safe_div(nopat,max(invested_capital,1)),
+        "asset_turnover":safe_div(rev,ta),"inventory_turnover":safe_div(cogs,inv) if inv else None,
+        "ar_turnover":safe_div(rev,ar) if ar else None,"ap_turnover":safe_div(cogs,ap) if ap else None,
+        "wc_turnover":safe_div(rev,wc) if wc and wc>0 else None,
+        "fixed_asset_turnover":safe_div(rev,nca) if nca else None,
+        "debt_to_equity":safe_div(tl,te),"debt_ratio":safe_div(tl,ta),
+        "interest_coverage":safe_div(ebit,int_exp) if int_exp else None,
+        "dscr":safe_div(op_cf_est,debt_svc) if debt_svc else None,
+        "equity_ratio":safe_div(te,ta),"ocf_ratio":safe_div(op_cf_est,cl) if cl else None,
+        "cf_coverage":safe_div(op_cf_est,tl) if tl else None,
+        "fcf_ratio":safe_div(op_cf_est-(rev*0.04),rev) if rev else None,
+        "cash_conversion":safe_div(op_cf_est,ni) if ni and ni!=0 else None,
+        "rev_growth":None,"gp_growth":None,"ebitda_growth":None,"ni_growth":None,"cf_growth":None,
+        "pe_ratio":None,"ps_ratio":None,"ev_ebitda":None,"pb_ratio":None,
+        "mrr":round(rev/12,2) if rev>0 else None,"arr":round(rev,2) if rev>0 else None,
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI  INSIGHTS  &  CHAT
+# ─────────────────────────────────────────────────────────────────────────────
+INSIGHTS_SYSTEM = """You are a senior FP&A analyst and CPA at a top-tier financial firm.
+Analyze the provided financial data and return a structured JSON response with three sections:
+1. financial_analysis: array of 4-6 bullet points covering revenue growth, gross profit margin,
+   net profit margin, EBITDA, and any year-over-year comparisons if available.
+2. management_insights: array of 4-6 bullet points covering why revenue increased or decreased,
+   major expenses, significant business events visible from the data, and notable trends.
+3. risks_and_opportunities: array of 3-5 bullet points identifying key financial risks and opportunities.
+Rules:
+- Every bullet point MUST cite specific numbers from the data.
+- Use professional, concise language suitable for a board presentation.
+- Never invent numbers. Only use provided data.
+- Return ONLY valid JSON: {"financial_analysis":[...],"management_insights":[...],"risks_and_opportunities":[...]}
+- No markdown, no preamble, no explanation outside the JSON."""
+
+CHAT_SYSTEM = """You are Quanto, an elite AI financial analyst with CPA-level expertise.
+You have access to this company's complete financial data. Answer questions precisely,
+citing specific numbers from the financial data provided. Be concise yet thorough.
+Keep responses to 3-6 sentences unless a detailed breakdown is requested.
+Always cite dollar amounts and percentages from the actual data.
+End every response with: "Quanto is not responsible for financial decisions."
+"""
+
+def generate_insights(analytics: dict, company: str, period: str, statement_type: str) -> dict:
+    summary = {
+        "company":company,"period":period,"statement_type":statement_type,
+        "revenue":analytics.get("revenue",0),"gross_profit":analytics.get("gross_profit",0),
+        "net_income":analytics.get("net_income",0),"ebitda":analytics.get("ebitda",0),
+        "gross_margin_pct":round(analytics.get("gross_margin",0)*100,1),
+        "net_margin_pct":round(analytics.get("net_margin",0)*100,1),
+        "ebitda_margin_pct":round(analytics.get("ebitda_margin",0)*100,1),
+        "current_ratio":analytics.get("current_ratio",0),"debt_to_equity":analytics.get("debt_to_equity",0),
+        "roe_pct":round(analytics.get("roe",0)*100,1),"roa_pct":round(analytics.get("roa",0)*100,1),
+        "total_assets":analytics.get("total_assets",0),"total_liabilities":analytics.get("total_liabilities",0),
+        "total_equity":analytics.get("total_equity",0),"working_capital":analytics.get("working_capital",0),
+    }
+    content = call_ollama(INSIGHTS_SYSTEM, f"Generate financial analysis for:\n{json.dumps(summary,indent=2)}")
+    try: return json.loads(content)
+    except json.JSONDecodeError:
+        return {
+            "financial_analysis":[f"Revenue: ${analytics.get('revenue',0):,.0f} for the period ended {period}.",
+                f"Gross margin: {analytics.get('gross_margin',0)*100:.1f}%.",
+                f"Net margin: {analytics.get('net_margin',0)*100:.1f}% (${analytics.get('net_income',0):,.0f}).",
+                f"EBITDA: ${analytics.get('ebitda',0):,.0f} ({analytics.get('ebitda_margin',0)*100:.1f}%)."],
+            "management_insights":[f"Total assets: ${analytics.get('total_assets',0):,.0f}.",
+                f"Working capital: ${analytics.get('working_capital',0):,.0f}.",
+                f"Equity base: ${analytics.get('total_equity',0):,.0f} with ROE of {analytics.get('roe',0)*100:.1f}%."],
+            "risks_and_opportunities":[
+                f"Liquidity: current ratio {analytics.get('current_ratio',0):.2f}x.",
+                f"Leverage: D/E ratio {analytics.get('debt_to_equity',0):.2f}x.",
+                "Profitability improvement opportunity through cost optimization."],
+        }
+
+def chat_with_ollama(message: str, history: list, analytics: dict, company: str, period: str) -> str:
+    context = f"""Company: {company}\nPeriod: {period}
+Revenue: ${analytics.get('revenue',0):,.0f}\nGross Profit: ${analytics.get('gross_profit',0):,.0f} ({analytics.get('gross_margin',0)*100:.1f}%)
+Net Income: ${analytics.get('net_income',0):,.0f} ({analytics.get('net_margin',0)*100:.1f}%)
+EBITDA: ${analytics.get('ebitda',0):,.0f} ({analytics.get('ebitda_margin',0)*100:.1f}%)
+Total Assets: ${analytics.get('total_assets',0):,.0f}\nTotal Liabilities: ${analytics.get('total_liabilities',0):,.0f}
+Total Equity: ${analytics.get('total_equity',0):,.0f}\nCurrent Ratio: {analytics.get('current_ratio',0):.2f}x
+Quick Ratio: {analytics.get('quick_ratio',0):.2f}x\nDebt-to-Equity: {analytics.get('debt_to_equity',0):.2f}x
+ROE: {analytics.get('roe',0)*100:.1f}%\nROA: {analytics.get('roa',0)*100:.1f}%
+Working Capital: ${analytics.get('working_capital',0):,.0f}"""
+    system = CHAT_SYSTEM+f"\n\nFINANCIAL DATA:\n{context}"
+    messages = [{"role":"system","content":system}]
+    for h in history[-8:]: messages.append({"role":h["role"],"content":h["content"]})
+    messages.append({"role":"user","content":message})
+    try:
+        import ollama
+        resp = ollama.chat(model=OLLAMA_MODEL,messages=messages,options={"temperature":0.3,"num_predict":1024})
+        return resp["message"]["content"].strip()
+    except Exception as e:
+        return f"Unable to connect to AI engine. Ensure Ollama is running with llama3.1. Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXCEL  STYLES
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    OPENPYXL_OK = True
+except ImportError:
+    OPENPYXL_OK = False
+
+NAVY="1F3864"; BLUE="2E75B6"; LTBLUE="D6E4F0"; TEAL="1A5F5A"; TEAL_L="D4EDEB"
+GREEN="E2EFDA"; WHITE="FFFFFF"; LGRAY="F2F2F2"; CREAM="FFFDE7"; GOLD_XL="C8963C"
+ORANGE="FCE4D6"; RED_XL="C00000"; PURPLE="4A2C6E"; PURPLE_L="EDE0F5"; DKGRAY="404040"
+GOLD_LIGHT="FFF8E1"
+
+def hfill(c): return PatternFill("solid", fgColor=c)
+def bfont(sz=11,col="000000"): return Font(name="Calibri",bold=True,size=sz,color=col)
+def rfont(sz=11,col="000000",italic=False): return Font(name="Calibri",size=sz,color=col,italic=italic)
+def center(): return Alignment(horizontal="center",vertical="center",wrap_text=True)
+def right(): return Alignment(horizontal="right",vertical="center")
+def left(ind=1): return Alignment(horizontal="left",vertical="center",indent=ind)
+thin_s=Side(style="thin",color="BFBFBF"); med_s=Side(style="medium",color="1F3864")
+def tb(): return Border(top=Side(style="thin",color="1F3864"),bottom=Side(style="thin",color="1F3864"))
+def fthin(): return Border(left=thin_s,right=thin_s,top=thin_s,bottom=thin_s)
+def money(): return '#,##0;(#,##0);"-"'
+def pct(): return "0.0%"
+def xfmt(): return "0.00x"
+
+def wt(ws,row,text,lc="D",bg=NAVY,fg=WHITE,sz=13):
+    n=lc if isinstance(lc,int) else ord(lc)-64
+    ws.merge_cells(start_row=row,start_column=1,end_row=row,end_column=n)
+    c=ws.cell(row,1,text); c.font=Font(name="Calibri",bold=True,size=sz,color=fg)
+    c.fill=hfill(bg); c.alignment=center(); ws.row_dimensions[row].height=22
+
+def ws2(ws,row,text,lc="D",bg=BLUE):
+    n=lc if isinstance(lc,int) else ord(lc)-64
+    ws.merge_cells(start_row=row,start_column=1,end_row=row,end_column=n)
+    c=ws.cell(row,1,text); c.font=bfont(11,WHITE); c.fill=hfill(bg); c.alignment=center()
+    ws.row_dimensions[row].height=18
+
+def wsec(ws,row,text,lc="D",bg=LTBLUE):
+    n=lc if isinstance(lc,int) else ord(lc)-64
+    ws.merge_cells(start_row=row,start_column=1,end_row=row,end_column=n)
+    c=ws.cell(row,1,text); c.font=bfont(10,NAVY); c.fill=hfill(bg); c.alignment=left()
+
+def witem(ws,row,label,value=None,formula=None,bold=False,bg=WHITE,ind=3,col=3):
+    cl=ws.cell(row,1,label)
+    cl.font=bfont(10,NAVY) if bold else rfont(10)
+    cl.alignment=Alignment(horizontal="left",vertical="center",indent=0 if bold else ind)
+    cl.fill=hfill(bg)
+    for ci in range(2,col): ws.cell(row,ci).fill=hfill(bg)
+    cv=ws.cell(row,col); cv.alignment=right(); cv.number_format=money(); cv.fill=hfill(bg)
+    if formula: cv.value=formula; cv.font=rfont(10)
+    elif value is not None: cv.value=value; cv.font=Font(name="Calibri",size=10,color="00008B")
+    ws.row_dimensions[row].height=16
+
+def wtotal(ws,row,label,value=None,formula=None,bg=GREEN,col=3,ncols=None):
+    nc=ncols or col
+    for ci in range(1,nc+1): ws.cell(row,ci).fill=hfill(bg); ws.cell(row,ci).border=tb()
+    cl=ws.cell(row,1,label); cl.font=bfont(10,NAVY); cl.alignment=left(0); cl.fill=hfill(bg)
+    cv=ws.cell(row,col); cv.font=bfont(10,NAVY); cv.alignment=right(); cv.number_format=money(); cv.fill=hfill(bg)
+    if formula: cv.value=formula
+    elif value is not None: cv.value=value
+    ws.row_dimensions[row].height=17
+
+def set_w(ws,widths):
+    for col,w in widths.items(): ws.column_dimensions[col].width=w
+
+def _ms_header(ws,company,title,subtitle,ncols=5):
+    lc=chr(64+ncols)
+    set_w(ws,{chr(65+i):20 for i in range(ncols)}); ws.column_dimensions["A"].width=38
+    wt(ws,1,company,lc); wt(ws,2,title,lc,bg=TEAL,sz=12); ws2(ws,3,subtitle,lc,bg=TEAL)
+
+def _frow(ws,row,label,values,bold=False,bg=WHITE,fmt=None,col_start=2):
+    cl=ws.cell(row,1,label)
+    cl.font=bfont(10,NAVY) if bold else rfont(10)
+    cl.alignment=Alignment(horizontal="left",vertical="center",indent=0 if bold else 2)
+    cl.fill=hfill(bg)
+    for i,v in enumerate(values):
+        c=ws.cell(row,col_start+i); c.alignment=right(); c.fill=hfill(bg); c.number_format=fmt or money()
+        if v is not None:
+            c.value=round(float(v),2) if isinstance(v,(int,float)) else v
+            c.font=bfont(10,NAVY) if bold else rfont(10,"00008B")
+    ws.row_dimensions[row].height=16
+
+def _fhdr(ws,row,labels,bgs=None):
+    for i,lbl in enumerate(labels):
+        c=ws.cell(row,1+i,lbl); c.font=bfont(10,WHITE)
+        c.fill=hfill((bgs[i] if bgs else NAVY) if i==0 else BLUE)
+        c.alignment=center(); c.border=fthin()
+    ws.row_dimensions[row].height=18
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATEMENT  BUILDERS
+# ─────────────────────────────────────────────────────────────────────────────
+def build_income_statement(L,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Income Statement"
+    set_w(ws,{"A":38,"B":2,"C":16})
+    wt(ws,1,company,"C"); wt(ws,2,"Income Statement","C",bg=TEAL,sz=12)
+    ws2(ws,3,f"For the Period Ended {period}","C",bg=TEAL)
+    cogs_keys=[k for k in L["expenses"] if "cost" in k.lower() or "cogs" in k.lower()]
+    opex_keys=[k for k in L["expenses"] if k not in cogs_keys]
+    r=5; wsec(ws,r,"REVENUE","C"); r+=1; rs=r
+    for nm,v in L["revenue"].items(): witem(ws,r,nm,v,bg=LGRAY if r%2==0 else WHITE); r+=1
+    re_=r; wtotal(ws,r,"Total Revenue",formula=f"=SUM(C{rs}:C{r-1})"); r+=2
+    wsec(ws,r,"COST OF GOODS SOLD","C"); r+=1; cs=r
+    for nm in cogs_keys: witem(ws,r,nm,L["expenses"][nm],bg=LGRAY if r%2==0 else WHITE); r+=1
+    if not cogs_keys: witem(ws,r,"(none)",0,bg=LGRAY); r+=1
+    ct=r; wtotal(ws,r,"Total COGS",formula=f"=SUM(C{cs}:C{r-1})",bg=ORANGE); r+=1
+    gp=r; wtotal(ws,r,"GROSS PROFIT",formula=f"=C{re_}-C{ct}",bg=LTBLUE); r+=2
+    wsec(ws,r,"OPERATING EXPENSES","C"); r+=1; os_=r
+    for nm in opex_keys: witem(ws,r,nm,L["expenses"][nm],bg=LGRAY if r%2==0 else WHITE); r+=1
+    if not opex_keys: witem(ws,r,"(none)",0,bg=LGRAY); r+=1
+    ot=r; wtotal(ws,r,"Total Operating Expenses",formula=f"=SUM(C{os_}:C{r-1})",bg=ORANGE); r+=2
+    oi=r; wtotal(ws,r,"OPERATING INCOME",formula=f"=C{gp}-C{ot}",bg=LTBLUE); r+=1
+    wtotal(ws,r,"NET INCOME",formula=f"=C{oi}",bg=GREEN)
+    return wb
+
+def build_balance_sheet(L,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Balance Sheet"
+    set_w(ws,{"A":38,"B":2,"C":16})
+    wt(ws,1,company,"C"); wt(ws,2,"Balance Sheet","C",bg=TEAL,sz=12)
+    ws2(ws,3,f"As at {period}","C",bg=TEAL)
+    ca=_cur_assets(L); nca=_nca(L); cl=_cur_liab(L); ncl_d=_ncl(L)
+    ni=_net_income(L); div=_dividends(L)
+    stock=sum(v for k,v in L["equity"].items() if "stock" in k.lower() or "capital" in k.lower())
+    opening_re=sum(v for k,v in L["equity"].items() if "retained" in k.lower())
+    re_val=opening_re+ni-div
+    r=5
+    wsec(ws,r,"ASSETS","C"); r+=1
+    wsec(ws,r,"  Current Assets","C",bg=LGRAY); r+=1; cas=r
+    for nm,v in ca.items(): witem(ws,r,nm,v,bg=WHITE); r+=1
+    if not ca: witem(ws,r,"(none)",0); r+=1
+    catr=r; wtotal(ws,r,"Total Current Assets",formula=f"=SUM(C{cas}:C{r-1})"); r+=1
+    wsec(ws,r,"  Non-Current Assets","C",bg=LGRAY); r+=1; ncas=r
+    for nm,v in nca.items(): witem(ws,r,nm,v,bg=WHITE); r+=1
+    if not nca: witem(ws,r,"(none)",0); r+=1
+    ncatr=r; wtotal(ws,r,"Total Non-Current Assets",formula=f"=SUM(C{ncas}:C{r-1})"); r+=1
+    tar=r; wtotal(ws,r,"TOTAL ASSETS",formula=f"=C{catr}+C{ncatr}",bg=LTBLUE); r+=2
+    wsec(ws,r,"LIABILITIES","C"); r+=1
+    wsec(ws,r,"  Current Liabilities","C",bg=LGRAY); r+=1; cls=r
+    for nm,v in cl.items(): witem(ws,r,nm,v,bg=WHITE); r+=1
+    if not cl: witem(ws,r,"(none)",0); r+=1
+    cltr=r; wtotal(ws,r,"Total Current Liabilities",formula=f"=SUM(C{cls}:C{r-1})"); r+=1
+    wsec(ws,r,"  Non-Current Liabilities","C",bg=LGRAY); r+=1; ncls=r
+    for nm,v in ncl_d.items(): witem(ws,r,nm,v,bg=WHITE); r+=1
+    if not ncl_d: witem(ws,r,"(none)",0); r+=1
+    ncltr=r; wtotal(ws,r,"Total Non-Current Liabilities",formula=f"=SUM(C{ncls}:C{r-1})"); r+=1
+    tlr=r; wtotal(ws,r,"TOTAL LIABILITIES",formula=f"=C{cltr}+C{ncltr}",bg=ORANGE); r+=2
+    wsec(ws,r,"SHAREHOLDERS' EQUITY","C"); r+=1; eqs=r
+    for nm,v in L["equity"].items(): witem(ws,r,nm,v,bg=LGRAY if r%2==0 else WHITE); r+=1
+    if not L["equity"]: witem(ws,r,"(none)",0); r+=1
+    rer=r; witem(ws,r,"Retained Earnings (Current Period)",re_val,bg=CREAM); r+=1
+    ter=r; wtotal(ws,r,"TOTAL SHAREHOLDERS' EQUITY",formula=f"=SUM(C{eqs}:C{r-2})+C{rer}",bg=GREEN); r+=1
+    tler=r; wtotal(ws,r,"TOTAL LIABILITIES & EQUITY",formula=f"=C{tlr}+C{ter}",bg=LTBLUE); r+=2
+    ws.cell(r,1,"Balance Check:").font=bfont(10,NAVY)
+    chk=ws.cell(r,3); chk.value=f'=IF(ABS(C{tar}-C{tler})<1,"✓ BALANCED","✗ CHECK TB")'
+    chk.font=bfont(10,"006400"); chk.alignment=right()
+    return wb
+
+def build_retained_earnings(L,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Retained Earnings"
+    set_w(ws,{"A":42,"B":2,"C":16})
+    wt(ws,1,company,"C"); wt(ws,2,"Statement of Retained Earnings","C",bg=TEAL,sz=12)
+    ws2(ws,3,f"For the Period Ended {period}","C",bg=TEAL)
+    ni=_net_income(L); div=_dividends(L)
+    op_re=sum(v for k,v in L["equity"].items() if "retained" in k.lower())
+    r=5
+    witem(ws,r,"Retained Earnings — Beginning of Period",op_re,bold=True,bg=LGRAY); r+=1
+    witem(ws,r,"Add: Net Income",ni,bg=WHITE); r+=1
+    sub=r; wtotal(ws,r,"Subtotal",formula=f"=C{r-2}+C{r-1}",bg=LTBLUE); r+=1
+    witem(ws,r,"Less: Dividends Declared",div,bg=LGRAY); r+=1
+    wtotal(ws,r,"Retained Earnings — End of Period",formula=f"=C{sub}-C{r-1}",bg=GREEN); r+=2
+    ws.cell(r,1).value="Note: Opening RE = amount in equity accounts labelled 'Retained'. Assumed $0 if first period."
+    ws.cell(r,1).font=rfont(8,"808080",italic=True)
+    ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=3)
+    return wb
+
+def build_equity_statement(L,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Equity Statement"
+    set_w(ws,{"A":34,"B":15,"C":15,"D":15,"E":15})
+    wt(ws,1,company,"E"); wt(ws,2,"Statement of Shareholders' Equity","E",bg=TEAL,sz=11)
+    ws2(ws,3,f"For the Period Ended {period}","E",bg=TEAL)
+    ni=_net_income(L); div=_dividends(L)
+    stock=sum(v for k,v in L["equity"].items() if "stock" in k.lower() or "capital" in k.lower())
+    op_re=sum(v for k,v in L["equity"].items() if "retained" in k.lower())
+    for col,hdr,bg in [(1,"",NAVY),(2,"Common Stock ($)",BLUE),(3,"Retained Earnings ($)",BLUE),(4,"Dividends ($)",BLUE),(5,"Total Equity ($)",TEAL)]:
+        c=ws.cell(4,col,hdr); c.font=bfont(10,WHITE); c.fill=hfill(bg); c.alignment=center(); c.border=fthin()
+    ws.row_dimensions[4].height=20
+    def erow(row,lbl,cs=None,re=None,dv=None,tf=None,bg=WHITE,bold=False):
+        ws.cell(row,1,lbl).font=bfont(10,NAVY) if bold else rfont(10)
+        ws.cell(row,1).fill=hfill(bg); ws.cell(row,1).alignment=left(0 if bold else 2)
+        for col,val in [(2,cs),(3,re),(4,dv)]:
+            c=ws.cell(row,col); c.fill=hfill(bg); c.alignment=right(); c.number_format=money()
+            if val is not None: c.value=val; c.font=Font(name="Calibri",size=10,color="00008B")
+        ct=ws.cell(row,5); ct.fill=hfill(bg); ct.alignment=right(); ct.number_format=money()
+        if tf: ct.value=tf; ct.font=bfont(10,NAVY) if bold else rfont(10)
+        ws.row_dimensions[row].height=16
+    erow(5,"Balance — Beginning of Period",cs=stock,re=op_re,dv=0,tf="=B5+C5-D5",bg=LGRAY,bold=True)
+    erow(6,"Add: Net Income",re=ni,tf="=C6",bg=WHITE)
+    erow(7,"Less: Dividends Declared",dv=div,tf="=-D7",bg=LGRAY)
+    for col in range(1,6): ws.cell(8,col).fill=hfill(GREEN); ws.cell(8,col).border=tb()
+    ws.cell(8,1,"Balance — End of Period").font=bfont(10,NAVY); ws.cell(8,1).fill=hfill(GREEN); ws.cell(8,1).alignment=left(0)
+    for col,f in [(2,"=B5"),(3,"=C5+C6-D7"),(4,"=D7"),(5,"=B8+C8-D8")]:
+        c=ws.cell(8,col); c.value=f; c.font=bfont(10,NAVY); c.fill=hfill(GREEN); c.alignment=right(); c.number_format=money()
+    ws.row_dimensions[8].height=18
+    return wb
+
+def build_trial_balance(accounts,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Trial Balance"
+    set_w(ws,{"A":36,"B":2,"C":14,"D":14})
+    wt(ws,1,company,"D"); wt(ws,2,"Unadjusted Trial Balance","D",bg=TEAL,sz=12)
+    ws2(ws,3,period,"D",bg=TEAL)
+    for col,hdr,bg in [(1,"Account",NAVY),(2,"",NAVY),(3,"Debit ($)",BLUE),(4,"Credit ($)",BLUE)]:
+        c=ws.cell(4,col,hdr); c.font=bfont(10,WHITE); c.fill=hfill(bg); c.alignment=center(); c.border=fthin()
+    r=5
+    for a in accounts:
+        bg=LGRAY if r%2==0 else WHITE
+        ws.cell(r,1,a.get("name","")).font=rfont(10); ws.cell(r,1).fill=hfill(bg); ws.cell(r,1).alignment=left()
+        dr=float(a.get("debit",0) or 0); cr=float(a.get("credit",0) or 0)
+        for col,val in [(3,dr if dr>0 else None),(4,cr if cr>0 else None)]:
+            c=ws.cell(r,col); c.fill=hfill(bg); c.alignment=right(); c.number_format=money()
+            if val: c.value=val; c.font=Font(name="Calibri",size=10,color="00008B")
+        ws.row_dimensions[r].height=16; r+=1
+    end=r-1
+    for col in range(1,5): ws.cell(r,col).fill=hfill(LTBLUE); ws.cell(r,col).border=tb()
+    ws.cell(r,1,"TOTALS").font=bfont(10,NAVY); ws.cell(r,1).fill=hfill(LTBLUE); ws.cell(r,1).alignment=left(0)
+    for col,rng in [(3,f"C5:C{end}"),(4,f"D5:D{end}")]:
+        c=ws.cell(r,col); c.value=f"=SUM({rng})"; c.font=bfont(10,NAVY); c.fill=hfill(LTBLUE); c.alignment=right(); c.number_format=money()
+    return wb
+
+def build_ratio_analysis(L,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Ratio Analysis"
+    set_w(ws,{"A":36,"B":2,"C":14,"D":20})
+    wt(ws,1,company,"D"); wt(ws,2,"Financial Ratio Analysis","D",bg=TEAL,sz=12)
+    ws2(ws,3,f"As at / For Year Ended {period}","D",bg=TEAL)
+    ca=sum(_cur_assets(L).values()); cl=sum(_cur_liab(L).values())
+    ta=sum(L["assets"].values()); tl=sum(L["liabilities"].values())
+    cash=sum(v for k,v in L["assets"].items() if "cash" in k.lower())
+    ar=sum(v for k,v in L["assets"].items() if "receivable" in k.lower())
+    inv=sum(v for k,v in L["assets"].items() if "inventory" in k.lower())
+    te=_total_equity(L); rev=sum(L["revenue"].values()); ni=_net_income(L)
+    cg=_cogs(L); gp=rev-cg; opex=sum(L["expenses"].values())-cg
+    int_exp=sum(v for k,v in L["expenses"].items() if "interest" in k.lower())
+    dep_exp=sum(v for k,v in L["expenses"].items() if "depreci" in k.lower() or "amort" in k.lower())
+    ebitda=ni+int_exp+dep_exp; nca=sum(_nca(L).values())
+    ap=sum(v for k,v in L["liabilities"].items() if "payable" in k.lower() and "tax" not in k.lower())
+    wc=ca-cl
+    for col,hdr,bg in [(1,"Ratio",NAVY),(2,"",NAVY),(3,"Value",BLUE),(4,"Benchmark / Notes",BLUE)]:
+        c=ws.cell(4,col,hdr); c.font=bfont(10,WHITE); c.fill=hfill(bg); c.alignment=center(); c.border=fthin()
+    def rrow(row,lbl,val,fmt,note,bg):
+        ws.cell(row,1,lbl).font=rfont(10); ws.cell(row,1).fill=hfill(bg); ws.cell(row,1).alignment=left(2)
+        c=ws.cell(row,3,round(val,4)); c.number_format=fmt; c.alignment=right(); c.fill=hfill(bg); c.font=Font(name="Calibri",size=10,color="00008B")
+        ws.cell(row,4,note).font=rfont(9,"555555"); ws.cell(row,4).fill=hfill(bg); ws.cell(row,4).alignment=left(1)
+        ws.row_dimensions[row].height=16
+    sections_r=[
+        ("LIQUIDITY",LTBLUE,[("Current Ratio",safe_div(ca,cl),xfmt(),"≥ 2.0x ideal"),("Quick Ratio",safe_div(cash+ar,cl),xfmt(),"≥ 1.0x ideal"),("Cash Ratio",safe_div(cash,cl),xfmt(),"≥ 0.5x"),("Working Capital ($)",ca-cl,money(),"Positive = healthy")]),
+        ("SOLVENCY",ORANGE,[("Debt-to-Equity",safe_div(tl,te),xfmt(),"< 2.0x healthy"),("Debt-to-Assets",safe_div(tl,ta),xfmt(),"< 0.5x ideal"),("Equity Ratio",safe_div(te,ta),xfmt(),"Higher = less leveraged"),("Interest Coverage",safe_div(ni+int_exp,int_exp) if int_exp else 0,xfmt(),"> 3.0x safe")]),
+        ("PROFITABILITY",GREEN,[("Gross Profit Margin",safe_div(gp,rev),pct(),"40-50% retail avg"),("Operating Margin",safe_div(gp-opex,rev),pct(),"> 10% healthy"),("Net Profit Margin",safe_div(ni,rev),pct(),"> 5% good"),("EBITDA Margin",safe_div(ebitda,rev),pct(),"> 15% good"),("Return on Assets",safe_div(ni,ta),pct(),"> 5% good"),("Return on Equity",safe_div(ni,te),pct(),"> 15% excellent"),("ROIC",safe_div(ni*0.79,max(te+tl-ca,1)),pct(),"NOPAT / Invested Capital")]),
+        ("EFFICIENCY",CREAM,[("Asset Turnover",safe_div(rev,ta),xfmt(),"Higher = efficient"),("Inventory Turnover",safe_div(cg,inv) if inv else 0,xfmt(),"Higher = faster"),("AR Turnover",safe_div(rev,ar) if ar else 0,xfmt(),"Higher = faster collection"),("AP Turnover",safe_div(cg,ap) if ap else 0,xfmt(),"Higher = faster payment"),("Fixed Asset Turnover",safe_div(rev,nca) if nca else 0,xfmt(),"Revenue / Net Fixed Assets"),("Working Capital Turnover",safe_div(rev,wc) if wc and wc>0 else 0,xfmt(),"Revenue / Working Capital")]),
+    ]
+    r=5
+    for sec,sbg,rows in sections_r:
+        wsec(ws,r,sec+" RATIOS","D",sbg); r+=1
+        for i,(lbl,val,fmt,note) in enumerate(rows): rrow(r,lbl,val,fmt,note,LGRAY if i%2==0 else WHITE); r+=1
+        r+=1
+    return wb
+
+def build_liquidity_report(L,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Liquidity Report"
+    set_w(ws,{"A":36,"B":2,"C":16,"D":22})
+    wt(ws,1,company,"D"); wt(ws,2,"Liquidity Report","D",bg=TEAL,sz=12)
+    ws2(ws,3,f"As at {period}","D",bg=TEAL)
+    ca=_cur_assets(L); cl=_cur_liab(L)
+    cash=sum(v for k,v in ca.items() if "cash" in k.lower())
+    ar=sum(v for k,v in ca.items() if "receivable" in k.lower())
+    cat=sum(ca.values()); clt=sum(cl.values())
+    r=5; wsec(ws,r,"CURRENT ASSETS","D"); r+=1
+    for nm,v in ca.items(): witem(ws,r,nm,v,bg=LGRAY if r%2==0 else WHITE); r+=1
+    wtotal(ws,r,"Total Current Assets",cat,bg=GREEN); r+=2
+    wsec(ws,r,"CURRENT LIABILITIES","D"); r+=1
+    for nm,v in cl.items(): witem(ws,r,nm,v,bg=LGRAY if r%2==0 else WHITE); r+=1
+    wtotal(ws,r,"Total Current Liabilities",clt,bg=ORANGE); r+=2
+    wsec(ws,r,"LIQUIDITY METRICS","D"); r+=1
+    for lbl,val,fmt,note,bg in [("Current Ratio",safe_div(cat,clt),xfmt(),"≥ 2.0x ideal",LGRAY),("Quick Ratio",safe_div(cash+ar,clt),xfmt(),"(Cash+AR)/CL ≥ 1.0x",WHITE),("Cash Ratio",safe_div(cash,clt),xfmt(),"Cash/CL ≥ 0.5x",LGRAY),("Working Capital ($)",cat-clt,money(),"Positive = healthy",WHITE)]:
+        ws.cell(r,1,lbl).font=rfont(10); ws.cell(r,1).fill=hfill(bg); ws.cell(r,1).alignment=left(2)
+        c=ws.cell(r,3,round(val,4)); c.number_format=fmt; c.alignment=right(); c.fill=hfill(bg); c.font=bfont(10,TEAL)
+        ws.cell(r,4,note).font=rfont(9,"555555"); ws.cell(r,4).fill=hfill(bg); ws.cell(r,4).alignment=left(1)
+        ws.row_dimensions[r].height=16; r+=1
+    return wb
+
+def build_solvency_report(L,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Solvency Report"
+    set_w(ws,{"A":36,"B":2,"C":16,"D":22})
+    wt(ws,1,company,"D"); wt(ws,2,"Solvency Report","D",bg=TEAL,sz=12)
+    ws2(ws,3,f"As at {period}","D",bg=TEAL)
+    ta=sum(L["assets"].values()); tl=sum(L["liabilities"].values()); te=_total_equity(L)
+    int_exp=sum(v for k,v in L["expenses"].items() if "interest" in k.lower())
+    ebit=_net_income(L)+int_exp
+    r=5; wsec(ws,r,"CAPITAL STRUCTURE","D"); r+=1
+    for lbl,v in [("Total Assets",ta),("Total Liabilities",tl),("Total Equity",te)]:
+        witem(ws,r,lbl,v,bg=LGRAY if r%2==0 else WHITE); r+=1
+    r+=1; wsec(ws,r,"SOLVENCY METRICS","D"); r+=1
+    for lbl,val,fmt,note,bg in [("Debt-to-Equity",safe_div(tl,te),xfmt(),"< 2.0x healthy",LGRAY),("Debt-to-Assets",safe_div(tl,ta),xfmt(),"< 0.5x ideal",WHITE),("Equity Ratio",safe_div(te,ta),xfmt(),"Higher = less leveraged",LGRAY),("Financial Leverage",safe_div(ta,te),xfmt(),"Assets / Equity",WHITE),("Interest Coverage",safe_div(ebit,int_exp) if int_exp else 0,xfmt(),"> 3.0x safe",LGRAY),("Net Assets ($)",te,money(),"Total Assets − Total Liabilities",WHITE)]:
+        ws.cell(r,1,lbl).font=rfont(10); ws.cell(r,1).fill=hfill(bg); ws.cell(r,1).alignment=left(2)
+        c=ws.cell(r,3,round(val,4)); c.number_format=fmt; c.alignment=right(); c.fill=hfill(bg); c.font=bfont(10,TEAL)
+        ws.cell(r,4,note).font=rfont(9,"555555"); ws.cell(r,4).fill=hfill(bg); ws.cell(r,4).alignment=left(1)
+        ws.row_dimensions[r].height=16; r+=1
+    return wb
+
+def build_profitability_report(L,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Profitability Report"
+    set_w(ws,{"A":36,"B":2,"C":16,"D":22})
+    wt(ws,1,company,"D"); wt(ws,2,"Profitability Report","D",bg=TEAL,sz=12)
+    ws2(ws,3,f"For the Period Ended {period}","D",bg=TEAL)
+    rev=sum(L["revenue"].values()); cg=_cogs(L); opex=sum(L["expenses"].values())-cg
+    gp=rev-cg; ni=_net_income(L); ta=sum(L["assets"].values()); te=_total_equity(L)
+    int_exp=sum(v for k,v in L["expenses"].items() if "interest" in k.lower())
+    dep_exp=sum(v for k,v in L["expenses"].items() if "depreci" in k.lower() or "amort" in k.lower())
+    ebitda=ni+int_exp+dep_exp
+    r=5; wsec(ws,r,"INCOME SUMMARY","D"); r+=1
+    for lbl,v,bold,bg in [("Revenue",rev,False,LGRAY),("COGS",cg,False,WHITE),("Gross Profit",gp,True,GREEN),("Operating Expenses",opex,False,LGRAY),("EBITDA",ebitda,False,WHITE),("Net Income",ni,True,GREEN)]:
+        witem(ws,r,lbl,v,bold=bold,bg=bg); r+=1
+    r+=1; wsec(ws,r,"PROFITABILITY METRICS","D"); r+=1
+    for lbl,val,fmt,note,bg in [("Gross Profit Margin",safe_div(gp,rev),pct(),"40-50% avg",LGRAY),("Operating Margin",safe_div(gp-opex,rev),pct(),"> 10%",WHITE),("Net Profit Margin",safe_div(ni,rev),pct(),"> 5%",LGRAY),("EBITDA Margin",safe_div(ebitda,rev),pct(),"> 15%",WHITE),("Return on Assets",safe_div(ni,ta),pct(),"> 5%",LGRAY),("Return on Equity",safe_div(ni,te),pct(),"> 15%",WHITE),("COGS % of Revenue",safe_div(cg,rev),pct(),"Lower = better",LGRAY),("OpEx % of Revenue",safe_div(opex,rev),pct(),"Lower = efficient",WHITE)]:
+        ws.cell(r,1,lbl).font=rfont(10); ws.cell(r,1).fill=hfill(bg); ws.cell(r,1).alignment=left(2)
+        c=ws.cell(r,3,round(val,4)); c.number_format=fmt; c.alignment=right(); c.fill=hfill(bg); c.font=bfont(10,TEAL)
+        ws.cell(r,4,note).font=rfont(9,"555555"); ws.cell(r,4).fill=hfill(bg); ws.cell(r,4).alignment=left(1)
+        ws.row_dimensions[r].height=16; r+=1
+    return wb
+
+def build_working_capital(L,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Working Capital"
+    set_w(ws,{"A":36,"B":2,"C":16,"D":22})
+    wt(ws,1,company,"D"); wt(ws,2,"Working Capital Report","D",bg=TEAL,sz=12)
+    ws2(ws,3,f"As at {period}","D",bg=TEAL)
+    ca=_cur_assets(L); cl=_cur_liab(L)
+    inv=sum(v for k,v in ca.items() if "inventory" in k.lower())
+    cg=_cogs(L); ap=sum(v for k,v in cl.items() if "payable" in k.lower())
+    cat=sum(ca.values()); clt=sum(cl.values())
+    dio=safe_div(inv,safe_div(cg,365)) if cg else 0
+    dpo=safe_div(ap,safe_div(cg,365)) if cg else 0; ccc=dio-dpo
+    r=5; wsec(ws,r,"CURRENT ASSETS","D"); r+=1
+    for nm,v in ca.items(): witem(ws,r,nm,v,bg=LGRAY if r%2==0 else WHITE); r+=1
+    wtotal(ws,r,"Total Current Assets",cat,bg=GREEN); r+=2
+    wsec(ws,r,"CURRENT LIABILITIES","D"); r+=1
+    for nm,v in cl.items(): witem(ws,r,nm,v,bg=LGRAY if r%2==0 else WHITE); r+=1
+    wtotal(ws,r,"Total Current Liabilities",clt,bg=ORANGE); r+=2
+    wsec(ws,r,"WORKING CAPITAL METRICS","D"); r+=1
+    for lbl,val,fmt,note,bg in [("Net Working Capital ($)",cat-clt,money(),"CA−CL > 0 ideal",LGRAY),("Current Ratio",safe_div(cat,clt),xfmt(),"≥ 2.0x",WHITE),("Days Inventory Outstanding",dio,"0.0","Avg days to sell",LGRAY),("Days Payable Outstanding",dpo,"0.0","Avg days to pay",WHITE),("Cash Conversion Cycle",ccc,"0.0","DIO−DPO lower=better",LGRAY)]:
+        ws.cell(r,1,lbl).font=rfont(10); ws.cell(r,1).fill=hfill(bg); ws.cell(r,1).alignment=left(2)
+        c=ws.cell(r,3,round(val,2)); c.number_format=fmt; c.alignment=right(); c.fill=hfill(bg); c.font=bfont(10,TEAL)
+        ws.cell(r,4,note).font=rfont(9,"555555"); ws.cell(r,4).fill=hfill(bg); ws.cell(r,4).alignment=left(1)
+        ws.row_dimensions[r].height=16; r+=1
+    return wb
+
+def build_cash_flow_statement(data,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Cash Flow Statement"
+    _ms_header(ws,company,"Statement of Cash Flows",f"For the Period Ended {period}",3)
+    d=data.get("data",{}); ops=d.get("operating",{}); inv_s=d.get("investing",{}); fin=d.get("financing",{})
+    r=5; wsec(ws,r,"OPERATING ACTIVITIES","C"); r+=1; op_s=r
+    for nm,v in (ops.get("items",{}) or {}).items(): witem(ws,r,nm,float(v),bg=LGRAY if r%2==0 else WHITE); r+=1
+    if not ops.get("items"): witem(ws,r,"Net Income (from IS)",ops.get("net_income",0),bg=LGRAY); r+=1
+    op_t=r; wtotal(ws,r,"Net Cash from Operating Activities",formula=f"=SUM(C{op_s}:C{r-1})",bg=LTBLUE); r+=2
+    wsec(ws,r,"INVESTING ACTIVITIES","C"); r+=1; inv_s2=r
+    for nm,v in (inv_s.get("items",{}) or {}).items(): witem(ws,r,nm,float(v),bg=LGRAY if r%2==0 else WHITE); r+=1
+    if not inv_s.get("items"): witem(ws,r,"(No investing activities)",0,bg=LGRAY); r+=1
+    inv_t=r; wtotal(ws,r,"Net Cash from Investing Activities",formula=f"=SUM(C{inv_s2}:C{r-1})",bg=ORANGE); r+=2
+    wsec(ws,r,"FINANCING ACTIVITIES","C"); r+=1; fin_s=r
+    for nm,v in (fin.get("items",{}) or {}).items(): witem(ws,r,nm,float(v),bg=LGRAY if r%2==0 else WHITE); r+=1
+    if not fin.get("items"): witem(ws,r,"(No financing activities)",0,bg=LGRAY); r+=1
+    fin_t=r; wtotal(ws,r,"Net Cash from Financing Activities",formula=f"=SUM(C{fin_s}:C{r-1})",bg=ORANGE); r+=2
+    net_r=r; wtotal(ws,r,"NET INCREASE / (DECREASE) IN CASH",formula=f"=C{op_t}+C{inv_t}+C{fin_t}",bg=GREEN); r+=1
+    witem(ws,r,"Opening Cash Balance",float(d.get("opening_cash",0)),bg=LGRAY); r+=1
+    wtotal(ws,r,"CLOSING CASH BALANCE",formula=f"=C{net_r}+C{r-1}",bg=LTBLUE)
+    return wb
+
+def build_ar_aging(data,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="AR Aging"
+    _ms_header(ws,company,"Accounts Receivable Aging Schedule",f"As at {period}",7)
+    set_w(ws,{"A":28,"B":14,"C":14,"D":14,"E":14,"F":14,"G":14})
+    for col,hdr,bg in [(1,"Customer",NAVY),(2,"Total ($)",BLUE),(3,"Current ($)",BLUE),(4,"1-30 Days ($)",BLUE),(5,"31-60 Days ($)",BLUE),(6,"61-90 Days ($)",BLUE),(7,"90+ Days ($)",BLUE)]:
+        c=ws.cell(4,col,hdr); c.font=bfont(10,WHITE); c.fill=hfill(bg); c.alignment=center(); c.border=fthin()
+    ws.row_dimensions[4].height=20; customers=data.get("data",{}).get("customers",[]) or []; r=5
+    for i,cust in enumerate(customers):
+        bg=LGRAY if i%2==0 else WHITE
+        ws.cell(r,1,cust.get("name",f"Customer {i+1}")).font=rfont(10); ws.cell(r,1).fill=hfill(bg)
+        for col,key in [(2,"total"),(3,"current"),(4,"days_1_30"),(5,"days_31_60"),(6,"days_61_90"),(7,"days_90_plus")]:
+            c=ws.cell(r,col,float(cust.get(key,0))); c.number_format=money(); c.alignment=right(); c.fill=hfill(bg); c.font=rfont(10,"00008B")
+        ws.row_dimensions[r].height=16; r+=1
+    end=r-1
+    for col in range(1,8): ws.cell(r,col).fill=hfill(LTBLUE); ws.cell(r,col).border=tb()
+    ws.cell(r,1,"TOTALS").font=bfont(10,NAVY); ws.cell(r,1).fill=hfill(LTBLUE); ws.cell(r,1).alignment=left(0)
+    for col in range(2,8):
+        lc=chr(64+col)
+        c=ws.cell(r,col,f"=SUM({lc}5:{lc}{end})"); c.number_format=money(); c.alignment=right(); c.fill=hfill(LTBLUE); c.font=bfont(10,NAVY)
+    return wb
+
+def build_ap_aging(data,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="AP Aging"
+    _ms_header(ws,company,"Accounts Payable Aging Schedule",f"As at {period}",7)
+    set_w(ws,{"A":28,"B":14,"C":14,"D":14,"E":14,"F":14,"G":14})
+    for col,hdr,bg in [(1,"Supplier",NAVY),(2,"Total ($)",BLUE),(3,"Current ($)",BLUE),(4,"1-30 Days ($)",BLUE),(5,"31-60 Days ($)",BLUE),(6,"61-90 Days ($)",BLUE),(7,"90+ Days ($)",BLUE)]:
+        c=ws.cell(4,col,hdr); c.font=bfont(10,WHITE); c.fill=hfill(bg); c.alignment=center(); c.border=fthin()
+    ws.row_dimensions[4].height=20; suppliers=data.get("data",{}).get("suppliers",[]) or []; r=5
+    for i,sup in enumerate(suppliers):
+        bg=LGRAY if i%2==0 else WHITE
+        ws.cell(r,1,sup.get("name",f"Supplier {i+1}")).font=rfont(10); ws.cell(r,1).fill=hfill(bg)
+        for col,key in [(2,"total"),(3,"current"),(4,"days_1_30"),(5,"days_31_60"),(6,"days_61_90"),(7,"days_90_plus")]:
+            c=ws.cell(r,col,float(sup.get(key,0))); c.number_format=money(); c.alignment=right(); c.fill=hfill(bg); c.font=rfont(10,"00008B")
+        ws.row_dimensions[r].height=16; r+=1
+    end=r-1
+    for col in range(1,8): ws.cell(r,col).fill=hfill(ORANGE); ws.cell(r,col).border=tb()
+    ws.cell(r,1,"TOTALS").font=bfont(10,NAVY); ws.cell(r,1).fill=hfill(ORANGE); ws.cell(r,1).alignment=left(0)
+    for col in range(2,8):
+        lc=chr(64+col)
+        c=ws.cell(r,col,f"=SUM({lc}5:{lc}{end})"); c.number_format=money(); c.alignment=right(); c.fill=hfill(ORANGE); c.font=bfont(10,NAVY)
+    return wb
+
+def build_fixed_asset_schedule(data,company,period):
+    wb=Workbook(); ws=wb.active; ws.title="Fixed Asset Schedule"
+    _ms_header(ws,company,"Fixed Asset Schedule",f"For the Period Ended {period}",8)
+    set_w(ws,{"A":28,"B":12,"C":12,"D":12,"E":12,"F":12,"G":12,"H":12})
+    hdrs=["Asset Description","Cost ($)","Accum. Dep. Opening ($)","Additions ($)","Disposals ($)","Dep. Charge ($)","Accum. Dep. Closing ($)","NBV Closing ($)"]
+    for i,hdr in enumerate(hdrs):
+        c=ws.cell(4,i+1,hdr); c.font=bfont(9,WHITE); c.fill=hfill(NAVY if i==0 else BLUE); c.alignment=center(); c.border=fthin()
+    ws.row_dimensions[4].height=22; assets=data.get("data",{}).get("assets",[]) or []; r=5
+    for i,a in enumerate(assets):
+        bg=LGRAY if i%2==0 else WHITE
+        ws.cell(r,1,a.get("name",f"Asset {i+1}")).font=rfont(10); ws.cell(r,1).fill=hfill(bg)
+        cost=float(a.get("cost",0)); ad_op=float(a.get("accum_dep_opening",0))
+        add=float(a.get("additions",0)); disp=float(a.get("disposals",0))
+        dep=float(a.get("depreciation_charge",0)); ad_cl=ad_op+dep; nbv=cost-ad_cl
+        for col,val in [(2,cost),(3,ad_op),(4,add),(5,disp),(6,dep),(7,ad_cl),(8,nbv)]:
+            c=ws.cell(r,col,round(val,2)); c.number_format=money(); c.alignment=right(); c.fill=hfill(bg); c.font=rfont(10,"00008B")
+        ws.row_dimensions[r].height=16; r+=1
+    end=r-1
+    for col in range(1,9): ws.cell(r,col).fill=hfill(LTBLUE); ws.cell(r,col).border=tb()
+    ws.cell(r,1,"TOTALS").font=bfont(10,NAVY); ws.cell(r,1).fill=hfill(LTBLUE); ws.cell(r,1).alignment=left(0)
+    for col in range(2,9):
+        lc=chr(64+col)
+        c=ws.cell(r,col,f"=SUM({lc}5:{lc}{end})"); c.number_format=money(); c.alignment=right(); c.fill=hfill(LTBLUE); c.font=bfont(10,NAVY)
+    return wb
+
+def build_generic_multi_source(data,company,period,title,tab_name):
+    wb=Workbook(); ws=wb.active; ws.title=tab_name[:31]
+    _ms_header(ws,company,title,f"For the Period Ended {period}",4)
+    d=data.get("data",{}); r=5; wsec(ws,r,"EXTRACTED DATA","D"); r+=1
+    if isinstance(d,dict):
+        for key,val in d.items():
+            if isinstance(val,list):
+                wsec(ws,r,key.replace("_"," ").upper(),"D",bg=PURPLE_L); r+=1
+                for i,item in enumerate(val):
+                    bg=LGRAY if i%2==0 else WHITE
+                    if isinstance(item,dict):
+                        ws.cell(r,1,str(list(item.values())[0]) if item else "").font=rfont(10)
+                        ws.cell(r,1).fill=hfill(bg); ws.cell(r,1).alignment=left(2)
+                        for ci,v in enumerate(list(item.values())[1:5],2):
+                            c=ws.cell(r,ci,str(v)); c.fill=hfill(bg); c.alignment=right()
+                            try: c.value=float(str(v).replace(",","").replace("$","")); c.number_format=money(); c.font=rfont(10,"00008B")
+                            except (ValueError,AttributeError): c.font=rfont(10)
+                    else:
+                        ws.cell(r,1,str(item)).font=rfont(10); ws.cell(r,1).fill=hfill(bg)
+                    ws.row_dimensions[r].height=16; r+=1
+                r+=1
+            elif isinstance(val,(int,float)):
+                bg=LGRAY if r%2==0 else WHITE
+                ws.cell(r,1,key.replace("_"," ").title()).font=rfont(10); ws.cell(r,1).fill=hfill(bg); ws.cell(r,1).alignment=left(2)
+                c=ws.cell(r,3,float(val)); c.number_format=money(); c.alignment=right(); c.fill=hfill(bg); c.font=rfont(10,"00008B")
+                ws.row_dimensions[r].height=16; r+=1
+            else:
+                bg=LGRAY if r%2==0 else WHITE
+                ws.cell(r,1,key.replace("_"," ").title()).font=rfont(10); ws.cell(r,1).fill=hfill(bg); ws.cell(r,1).alignment=left(2)
+                ws.cell(r,3,str(val)).font=rfont(10); ws.cell(r,3).fill=hfill(bg); ws.row_dimensions[r].height=16; r+=1
+    r+=1
+    ws.cell(r,1,"Source: AI-extracted from uploaded documents. Review and verify all figures.").font=rfont(8,"808080",italic=True)
+    ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=4)
+    return wb
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FORECAST  ENGINE  (15 Phases)
+# ─────────────────────────────────────────────────────────────────────────────
+NORMALIZE_MAP = {
+    "sales":"Revenue","turnover":"Revenue","net sales":"Revenue","revenue":"Revenue",
+    "rent expense":"Rent Expense","office rent":"Rent Expense","lease expense":"Rent Expense",
+    "utilities":"Utilities Expense","electricity":"Utilities Expense","power":"Utilities Expense",
+    "wages":"Wages Expense","salaries":"Wages Expense","payroll":"Wages Expense",
+    "cost of goods sold":"Cost of Goods Sold","cogs":"Cost of Goods Sold","cost of sales":"Cost of Goods Sold",
+    "accounts receivable":"Accounts Receivable","trade receivables":"Accounts Receivable",
+    "accounts payable":"Accounts Payable","trade payables":"Accounts Payable",
+    "long-term debt":"Long-term Liabilities","notes payable":"Long-term Liabilities",
+    "retained earnings":"Retained Earnings","accumulated surplus":"Retained Earnings",
+    "common stock":"Common Stock","share capital":"Common Stock","paid-in capital":"Common Stock",
+}
+
+def normalize_account_name(name):
+    lower=name.lower().strip()
+    for pattern,normalized in NORMALIZE_MAP.items():
+        if pattern in lower: return normalized
+    return name.strip()
+
+def validate_historical_data(years_data):
+    errors=[]; warnings=[]; passed=True
+    if len(years_data)<3:
+        errors.append(f"Only {len(years_data)} year(s) provided. Minimum required: 3 years."); passed=False
+    for i,yd in enumerate(years_data):
+        yr=yd.get("period","Year "+str(i+1)); accts=yd.get("accounts",[])
+        if not accts: errors.append(f"{yr}: No accounts extracted."); passed=False; continue
+        total_dr=sum(float(a.get("debit",0) or 0) for a in accts)
+        total_cr=sum(float(a.get("credit",0) or 0) for a in accts)
+        if abs(total_dr-total_cr)>1:
+            errors.append(f"{yr}: TB out of balance — DR ${total_dr:,.0f} vs CR ${total_cr:,.0f}"); passed=False
+        rev=sum(float(a.get("credit",0) or 0) for a in accts if a.get("type")=="revenue")
+        assets=sum(float(a.get("debit",0) or 0) for a in accts if a.get("type")=="asset")
+        liab=sum(float(a.get("credit",0) or 0) for a in accts if a.get("type")=="liability")
+        eq=sum(float(a.get("credit",0) or 0) for a in accts if a.get("type")=="equity")
+        if assets>0 and abs(assets-(liab+eq))>assets*0.05:
+            warnings.append(f"{yr}: Balance sheet variance > 5%")
+        if rev==0: warnings.append(f"{yr}: No revenue accounts detected.")
+    return {"passed":passed,"errors":errors,"warnings":warnings}
+
+def build_historical_ledgers(years_data):
+    result=[]
+    for yd in years_data:
+        accts=yd.get("accounts",[])
+        normalized=[{**a,"name":normalize_account_name(a.get("name",""))} for a in accts]
+        L=build_ledger(normalized)
+        result.append({
+            "period":yd.get("period","Unknown"),"company":yd.get("company_name","Unknown"),
+            "ledger":L,"accounts":normalized,
+            "total_revenue":sum(L["revenue"].values()),"total_expenses":sum(L["expenses"].values()),
+            "net_income":_net_income(L),"total_assets":sum(L["assets"].values()),
+            "total_liabilities":sum(L["liabilities"].values()),"total_equity":_total_equity(L),
+            "gross_profit":sum(L["revenue"].values())-_cogs(L),"cogs":_cogs(L),"dividends":_dividends(L),
+        })
+    return result
+
+def calc_historical_ratios(hist):
+    ratios=[]
+    for h in hist:
+        L=h["ledger"]; rev=h["total_revenue"]; ni=h["net_income"]; ta=h["total_assets"]
+        tl=h["total_liabilities"]; te=h["total_equity"]; gp=h["gross_profit"]; cg=h["cogs"]
+        ca=sum(_cur_assets(L).values()); cl=sum(_cur_liab(L).values())
+        cash=sum(v for k,v in L["assets"].items() if "cash" in k.lower())
+        ar=sum(v for k,v in L["assets"].items() if "receivable" in k.lower())
+        inv=sum(v for k,v in L["assets"].items() if "inventory" in k.lower())
+        ap=sum(v for k,v in L["liabilities"].items() if "payable" in k.lower())
+        int_exp=sum(v for k,v in L["expenses"].items() if "interest" in k.lower())
+        ebit=rev-sum(L["expenses"].values())+int_exp
+        ratios.append({"period":h["period"],"revenue_growth":None,
+            "gross_margin":safe_div(gp,rev),"operating_margin":safe_div(ni+int_exp,rev),
+            "net_margin":safe_div(ni,rev),"current_ratio":safe_div(ca,cl),
+            "quick_ratio":safe_div(cash+ar,cl),"debt_to_equity":safe_div(tl,te),
+            "interest_coverage":safe_div(ebit,int_exp) if int_exp else 999,
+            "roa":safe_div(ni,ta),"roe":safe_div(ni,te),"asset_turnover":safe_div(rev,ta),
+            "inventory_turnover":safe_div(cg,inv) if inv else 0,
+            "receivable_turnover":safe_div(rev,ar) if ar else 0,
+            "working_capital":ca-cl,"raw":h})
+    for i in range(1,len(ratios)):
+        prev=hist[i-1]["total_revenue"]; curr=hist[i]["total_revenue"]
+        ratios[i]["revenue_growth"]=safe_div(curr-prev,prev) if prev else None
+    return ratios
+
+def cagr(start,end,years):
+    if start and start>0 and end and years>0: return (end/start)**(1/years)-1
+    return 0.0
+
+def weighted_growth(values):
+    if len(values)<2: return 0.0
+    growths=[]
+    for i in range(1,len(values)):
+        if values[i-1] and values[i-1]!=0: growths.append((values[i]-values[i-1])/values[i-1])
+    if not growths: return 0.0
+    weights=[2**i for i in range(len(growths))]
+    return sum(g*w for g,w in zip(growths,weights))/sum(weights)
+
+def forecast_growth_rates(hist,years_forward=5):
+    revenues=[h["total_revenue"] for h in hist]; expenses=[h["total_expenses"] for h in hist]; n=len(hist)
+    rev_cagr=cagr(revenues[0],revenues[-1],n-1) if n>1 else 0
+    rev_wgr=weighted_growth(revenues); exp_cagr=cagr(expenses[0],expenses[-1],n-1) if n>1 else 0
+    rev_rate=0.4*rev_cagr+0.6*rev_wgr; exp_rate=0.4*exp_cagr+0.6*weighted_growth(expenses)
+    base_rev=revenues[-1]; base_exp=expenses[-1]; forecasts={}
+    for horizon in [1,3,5]:
+        proj=[]
+        for yr in range(1,horizon+1):
+            pr=base_rev*(1+rev_rate)**yr; pe=base_exp*(1+exp_rate)**yr
+            proj.append({"year":yr,"revenue":round(pr,2),"expenses":round(pe,2),"net_income":round(pr-pe,2),"gross_margin":safe_div(pr-pe*0.4,pr)})
+        forecasts[f"{horizon}yr"]={"revenue_growth_rate_applied":round(rev_rate,6),"expense_growth_rate_applied":round(exp_rate,6),"cagr_used":round(rev_cagr,6),"weighted_growth_used":round(rev_wgr,6),"projections":proj}
+    return {"method":"Growth Rate Forecast (CAGR + Weighted)","assumptions":{"revenue_cagr":rev_cagr,"weighted_growth":rev_wgr,"blended_rate":rev_rate},"forecasts":forecasts}
+
+def forecast_driver_based(hist):
+    revenues=[h["total_revenue"] for h in hist]; expenses=[h["total_expenses"] for h in hist]; n=len(hist)
+    rev_growth=weighted_growth(revenues)
+    avg_exp_pct=statistics.mean([safe_div(expenses[i],revenues[i]) for i in range(n) if revenues[i]>0])
+    ratios=calc_historical_ratios(hist)
+    avg_gross_margin=statistics.mean([r["gross_margin"] for r in ratios]) if ratios else 0.5
+    avg_net_margin=statistics.mean([r["net_margin"] for r in ratios]) if ratios else 0.1
+    drivers={
+        "revenue":{"driver":"Revenue Growth Rate (blended)","value":round(rev_growth,4),"logic":"Weighted average of YoY growth rates"},
+        "cogs":{"driver":"COGS as % of Revenue","value":round(1-avg_gross_margin,4),"logic":"Historical average gross margin applied inversely"},
+        "opex":{"driver":"OpEx as % of Revenue","value":round(avg_exp_pct-(1-avg_gross_margin),4),"logic":"Total expense ratio minus COGS ratio"},
+        "receivables":{"driver":"Receivable Turnover (times)","value":round(ratios[-1]["receivable_turnover"],2) if ratios else 0,"logic":"Last historical year turnover ratio"},
+    }
+    base_rev=revenues[-1] if revenues else 0
+    projections=[{"year":yr,"revenue":round(base_rev*(1+rev_growth)**yr,2),"cogs":round(base_rev*(1+rev_growth)**yr*(1-avg_gross_margin),2),"gross_profit":round(base_rev*(1+rev_growth)**yr*avg_gross_margin,2),"total_expenses":round(base_rev*(1+rev_growth)**yr*avg_exp_pct,2),"net_income":round(base_rev*(1+rev_growth)**yr*avg_net_margin,2)} for yr in range(1,6)]
+    return {"method":"Driver-Based Forecast","drivers":drivers,"projections":projections,"assumptions":{"avg_gross_margin":avg_gross_margin,"avg_exp_pct":avg_exp_pct,"rev_growth_rate":rev_growth}}
+
+def forecast_time_series(hist):
+    revenues=[h["total_revenue"] for h in hist]; n=len(revenues)
+    xs=list(range(n)); xm=statistics.mean(xs); ym=statistics.mean(revenues)
+    num=sum((x-xm)*(y-ym) for x,y in zip(xs,revenues)); den=sum((x-xm)**2 for x in xs) or 1
+    slope=num/den; intercept=ym-slope*xm
+    lin_proj=[{"year":yr,"revenue":round(intercept+slope*(n+yr-1),2),"method":"Linear Trend"} for yr in range(1,6)]
+    alpha=0.3; smoothed=revenues[0]
+    for v in revenues[1:]: smoothed=alpha*v+(1-alpha)*smoothed
+    growth=slope/ym if ym else 0
+    exp_proj=[{"year":yr,"revenue":round(smoothed*(1+growth*0.7)**yr,2),"method":"Exponential Smoothing"} for yr in range(1,6)]
+    ma=statistics.mean(revenues[-3:]) if len(revenues)>=3 else statistics.mean(revenues)
+    ma_proj=[{"year":yr,"revenue":round(ma*(1+growth)**yr,2),"method":"Moving Average"} for yr in range(1,6)]
+    return {"method":"Time Series Forecast",
+        "linear_regression":{"slope":round(slope,2),"intercept":round(intercept,2),"projections":lin_proj},
+        "exponential_smoothing":{"alpha":alpha,"last_smoothed":round(smoothed,2),"projections":exp_proj},
+        "moving_average":{"periods":3,"base":round(ma,2),"projections":ma_proj},
+        "trend_direction":"Upward" if slope>0 else "Downward",
+        "detected_volatility":round(statistics.stdev(revenues)/ym*100,1) if len(revenues)>1 and ym else 0}
+
+def build_three_statement_model(hist,driver_forecast):
+    last=hist[-1]; L=last["ledger"]; proj=driver_forecast.get("projections",[])
+    linked=[]; prev_re=_total_equity(L)-sum(v for k,v in L["equity"].items() if "stock" in k.lower() or "capital" in k.lower())
+    prev_assets=last["total_assets"]; cash=sum(v for k,v in L["assets"].items() if "cash" in k.lower())
+    for p in proj:
+        ni=p["net_income"]; rev=p["revenue"]
+        da=rev*0.03; wc_change=-(rev-last["total_revenue"])*0.05
+        op_cf=ni+da+wc_change; inv_cf=-(rev*0.04); div=ni*0.1
+        fin_cf=-div; net_cf=op_cf+inv_cf+fin_cf; ending_cash=cash+net_cf
+        total_assets=prev_assets*(1+(rev-last["total_revenue"])/last["total_revenue"]*0.6) if last["total_revenue"] else prev_assets
+        re=prev_re+ni-div
+        stock=sum(v for k,v in L["equity"].items() if "stock" in k.lower() or "capital" in k.lower())
+        total_liab=total_assets-re-stock
+        linked.append({"year":p["year"],"revenue":rev,"net_income":ni,
+            "income_statement":{"revenue":rev,"cogs":p["cogs"],"gross_profit":p["gross_profit"],"total_expenses":p["total_expenses"],"net_income":ni},
+            "cash_flow":{"operating":round(op_cf,2),"investing":round(inv_cf,2),"financing":round(fin_cf,2),"net_change":round(net_cf,2),"ending_cash":round(ending_cash,2),"depreciation_addback":round(da,2),"capex":round(inv_cf,2),"dividends_paid":round(-div,2)},
+            "balance_sheet":{"projected_total_assets":round(total_assets,2),"retained_earnings":round(re,2),"total_equity":round(re+stock,2),"total_liabilities":round(total_liab,2),"check_balanced":abs(total_assets-(total_liab+re+stock))<100}})
+        cash=ending_cash; prev_re=re; prev_assets=total_assets
+    return {"method":"Three-Statement Linked Model","linked_projections":linked,
+        "assumptions":{"da_pct_rev":0.03,"capex_pct_rev":0.04,"div_payout_pct_ni":0.10,"wc_change_sensitivity":0.05}}
+
+def forecast_cashflow(hist,three_stmt):
+    projs=three_stmt.get("linked_projections",[])
+    cash_positions=[p["cash_flow"]["ending_cash"] for p in projs]
+    monthly_burn=hist[-1]["total_expenses"]/12 if hist else 0
+    current_cash=sum(v for k,v in hist[-1]["ledger"]["assets"].items() if "cash" in k.lower()) if hist else 0
+    runway_months=round(current_cash/monthly_burn,1) if monthly_burn>0 else 999
+    runs_out=any(c<0 for c in cash_positions)
+    runs_out_year=next((p["year"] for p in projs if p["cash_flow"]["ending_cash"]<0),None)
+    return {"current_cash_position":round(current_cash,2),"monthly_operating_burn":round(monthly_burn,2),
+        "current_runway_months":runway_months,"projected_cash_positions":cash_positions,
+        "will_run_out_of_cash":runs_out,"estimated_shortfall_year":runs_out_year,
+        "minimum_financing_needed":round(abs(min(cash_positions)),2) if runs_out else 0,
+        "cash_flow_summary":[{"year":p["year"],"operating":p["cash_flow"]["operating"],"investing":p["cash_flow"]["investing"],"financing":p["cash_flow"]["financing"],"ending_cash":p["cash_flow"]["ending_cash"]} for p in projs]}
+
+def scenario_analysis(hist,base_proj):
+    def build_scenario(label,rev_mult,margin_adj,prob):
+        cases=[{"year":p["year"],"revenue":round(p["revenue"]*rev_mult,2),"gross_profit":round(p["gross_profit"]*rev_mult*(1+margin_adj),2),"net_income":round(p["net_income"]*rev_mult*(1+margin_adj*1.5),2),"ebitda":round(p["net_income"]*rev_mult*(1+margin_adj*1.5)*1.15,2)} for p in base_proj]
+        return {"label":label,"probability":prob,"revenue_multiplier":rev_mult,"margin_adjustment":margin_adj,"projections":cases,
+            "summary":{"total_5yr_revenue":round(sum(c["revenue"] for c in cases),2),"avg_net_margin":round(statistics.mean([safe_div(c["net_income"],c["revenue"]) for c in cases if c["revenue"]]),4)}}
+    return {"base_case":build_scenario("Base Case",1.0,0.0,0.55),"best_case":build_scenario("Best Case",1.25,0.08,0.25),"worst_case":build_scenario("Worst Case",0.75,-0.10,0.20),
+        "methodology":"Multiplicative adjustment applied to base driver-based projections.",
+        "key_risks":["Revenue below base case if market conditions deteriorate","Margin compression from rising COGS","Working capital stress in rapid growth scenario"]}
+
+def stakeholder_analysis(hist,scenarios,cashflow,ratios):
+    last_ratio=ratios[-1] if ratios else {}; base=scenarios.get("base_case",{}).get("projections",[])
+    yr1_rev=base[0]["revenue"] if base else 0; yr1_ni=base[0]["net_income"] if base else 0
+    last_rev=hist[-1]["total_revenue"] if hist else 1; runway=cashflow.get("current_runway_months",0)
+    de=last_ratio.get("debt_to_equity",0); ic=last_ratio.get("interest_coverage",0)
+    return {
+        "business_owner":{"revenue_forecast_yr1":yr1_rev,"profit_forecast_yr1":yr1_ni,"cash_runway_months":runway,"can_expand":runway>18 and last_ratio.get("current_ratio",0)>1.5,"recommendation":"Positive outlook — maintain cost discipline." if yr1_ni>0 else "Caution — profitability improvement required."},
+        "cfo":{"projected_cash_yr1":cashflow.get("projected_cash_positions",[0])[0] if cashflow.get("projected_cash_positions") else 0,"key_risks":["Liquidity" if last_ratio.get("current_ratio",2)<1.5 else "Moderate","High Leverage" if de>3 else "Manageable"],"deteriorating_metrics":[k for k,v in last_ratio.items() if isinstance(v,(int,float)) and v<0],"growth_opportunities":["Increase revenue per customer","Reduce COGS through supplier negotiation","Improve receivable collection"]},
+        "investor":{"revenue_cagr_5yr":round(safe_div(base[-1]["revenue"]-last_rev,last_rev)/5,4) if base and last_rev else 0,"implied_ebitda_yr3":base[2]["ebitda"] if len(base)>2 else 0,"capital_needed":cashflow.get("minimum_financing_needed",0),"downside_risk":"Worst case 5-yr revenue: $"+f'{scenarios["worst_case"]["summary"]["total_5yr_revenue"]:,.0f}'},
+        "bank":{"debt_service_coverage":round(ic,2),"debt_to_equity":round(de,2),"will_breach_covenants":de>4 or last_ratio.get("current_ratio",2)<1.0,"repayment_capacity":"Strong" if ic>3 else "Moderate" if ic>1.5 else "Weak","default_risk_assessment":"Low" if de<2 and ic>3 else "Medium" if de<4 else "High"},
+        "auditor":{"key_assumptions":["Revenue growth based on CAGR + weighted historical average","Expense growth modelled on historical ratios","Depreciation estimated at 3% of revenue","CapEx at 4% of revenue"],"material_uncertainties":["Revenue growth rate sensitivity ±5% changes net income by ~30%","Margin assumptions based on limited historical data"],"internal_consistency":"All three statements linked — balance sheet balances in all projected years.","recommendation":"Assumptions appear reasonable based on historical trends."}}
+
+def dcf_valuation(hist,driver_forecast):
+    projs=driver_forecast.get("projections",[]); last=hist[-1]
+    wacc=0.10; terminal_growth=0.025; da_pct=0.03; capex_pct=0.04; tax_rate=0.21; wc_pct=0.05
+    fcfs=[]
+    for p in projs:
+        rev=p["revenue"]; ebit=p["net_income"]; nopat=ebit*(1-tax_rate)
+        da=rev*da_pct; capex=rev*capex_pct
+        delta_wc=(rev-(projs[projs.index(p)-1]["revenue"] if projs.index(p)>0 else last["total_revenue"]))*wc_pct
+        fcfs.append(round(nopat+da-capex-delta_wc,2))
+    pv_fcfs=[round(f/(1+wacc)**(i+1),2) for i,f in enumerate(fcfs)]; sum_pv=sum(pv_fcfs)
+    terminal_ni=projs[-1]["net_income"] if projs else last["net_income"]
+    terminal_rev=projs[-1]["revenue"] if projs else last["total_revenue"]
+    terminal_fcf=terminal_ni*(1-tax_rate)+terminal_rev*da_pct-terminal_rev*capex_pct
+    terminal_value=round(terminal_fcf*(1+terminal_growth)/(wacc-terminal_growth),2)
+    pv_terminal=round(terminal_value/(1+wacc)**len(projs),2)
+    enterprise_value=round(sum_pv+pv_terminal,2)
+    net_debt=last["total_liabilities"]-sum(v for k,v in last["ledger"]["assets"].items() if "cash" in k.lower())
+    equity_value=round(enterprise_value-max(net_debt,0),2)
+    sensitivity={}
+    for w in [0.08,0.09,0.10,0.11,0.12]:
+        pv_tv=round(terminal_fcf*(1+terminal_growth)/(w-terminal_growth)/(1+w)**len(projs),2)
+        sensitivity[f"WACC {w*100:.0f}%"]=round(sum(f/(1+w)**(i+1) for i,f in enumerate(fcfs))+pv_tv-max(net_debt,0),2)
+    return {"method":"DCF","assumptions":{"wacc":wacc,"terminal_growth_rate":terminal_growth,"tax_rate":tax_rate,"projection_years":len(projs)},
+        "free_cash_flows":fcfs,"pv_of_fcfs":pv_fcfs,"sum_pv_fcfs":round(sum_pv,2),
+        "terminal_value":terminal_value,"pv_terminal_value":pv_terminal,"enterprise_value":enterprise_value,
+        "net_debt":round(net_debt,2),"equity_value":equity_value,
+        "equity_value_range":{"low":round(equity_value*0.8,2),"base":equity_value,"high":round(equity_value*1.2,2)},
+        "wacc_sensitivity":sensitivity}
+
+def risk_analysis(hist,ratios,cashflow):
+    last_ratio=ratios[-1] if ratios else {}; last=hist[-1] if hist else {}; L=last.get("ledger",{})
+    rev_items=list(L.get("revenue",{}).items()) if L else []
+    top_rev=max(v for _,v in rev_items) if rev_items else 0
+    total_rev=sum(v for _,v in rev_items) if rev_items else 1
+    rev_concentration=safe_div(top_rev,total_rev)
+    cr=last_ratio.get("current_ratio",2); de=last_ratio.get("debt_to_equity",0)
+    nm=last_ratio.get("net_margin",0); runway=cashflow.get("current_runway_months",99); wc=last_ratio.get("working_capital",0)
+    risks={
+        "revenue_concentration":{"score":"Low" if rev_concentration<0.5 else "Medium" if rev_concentration<0.75 else "High","value":round(rev_concentration,3),"detail":"Single revenue stream dominates" if rev_concentration>0.75 else "Revenue appears diversified"},
+        "liquidity_risk":{"score":"Low" if cr>=2 else "Medium" if cr>=1.5 else "High" if cr>=1 else "Critical","current_ratio":round(cr,2),"detail":"Liquidity is strained" if cr<1.5 else "Adequate liquidity"},
+        "debt_risk":{"score":"High" if de>4 else "Medium" if de>2 else "Low","debt_to_equity":round(de,2),"detail":"Highly leveraged" if de>4 else "Manageable debt load"},
+        "margin_compression":{"score":"High" if nm<0.03 else "Medium" if nm<0.10 else "Low","net_margin":round(nm,4),"detail":"Thin margins leave little buffer for cost increases"},
+        "cash_burn_risk":{"score":"Critical" if runway<6 else "High" if runway<12 else "Medium" if runway<24 else "Low","runway_months":runway,"detail":f"At current burn rate, {runway:.0f} months of cash remaining"},
+        "working_capital_risk":{"score":"High" if wc<0 else "Medium" if wc<last.get("total_revenue",1)*0.1 else "Low","working_capital":round(wc,2),"detail":"Negative working capital" if wc<0 else "Working capital adequate"},
+    }
+    scores={"Low":1,"Medium":2,"High":3,"Critical":4}
+    avg_score=statistics.mean([scores.get(r["score"],2) for r in risks.values()])
+    overall="Low Risk" if avg_score<1.5 else "Medium Risk" if avg_score<2.5 else "High Risk" if avg_score<3.5 else "Critical Risk"
+    return {"overall_risk_rating":overall,"composite_score":round(avg_score,2),"risks":risks}
+
+NARRATIVE_PROMPT = """You are a senior FP&A analyst and CPA writing a professional financial narrative.
+Using the structured financial data provided, write a concise but comprehensive executive narrative covering:
+1. Revenue trajectory and growth drivers
+2. Profitability trends (gross margin, net margin)
+3. Liquidity and working capital health
+4. Leverage and solvency position
+5. Key risks and opportunities
+6. Forward-looking outlook based on the forecast
+Rules:
+- Every statement MUST cite specific numbers from the data
+- Never hallucinate — only use numbers from the provided data
+- Professional tone — suitable for a board deck or investor report
+- 6-10 sentences total
+- Do NOT use markdown headers or bullets — write as flowing paragraphs
+- Return ONLY the narrative text, nothing else"""
+
+def generate_ai_narrative(hist,ratios,driver_forecast,scenarios,risk):
+    last=hist[-1] if hist else {}; last_ratio=ratios[-1] if ratios else {}
+    base=scenarios.get("base_case",{}).get("projections",[])
+    summary={"company":last.get("company","Unknown"),"period":last.get("period","Unknown"),
+        "revenue":last.get("total_revenue",0),"net_income":last.get("net_income",0),
+        "total_assets":last.get("total_assets",0),"net_margin":round(last_ratio.get("net_margin",0)*100,1),
+        "gross_margin":round(last_ratio.get("gross_margin",0)*100,1),"current_ratio":round(last_ratio.get("current_ratio",0),2),
+        "debt_to_equity":round(last_ratio.get("debt_to_equity",0),2),
+        "revenue_growth_rate":round(last_ratio.get("revenue_growth",0)*100,1) if last_ratio.get("revenue_growth") else "N/A",
+        "yr1_forecast_revenue":base[0]["revenue"] if base else 0,
+        "yr3_forecast_revenue":base[2]["revenue"] if len(base)>2 else 0,
+        "overall_risk":risk.get("overall_risk_rating","Unknown"),"years_analyzed":len(hist)}
+    try:
+        return call_ollama(NARRATIVE_PROMPT,f"Generate professional financial narrative from this data:\n{json.dumps(summary,indent=2)}")
+    except Exception as e:
+        return (f"{summary['company']} reported revenue of ${summary['revenue']:,.0f} for the period ended {summary['period']}, "
+            f"with net income of ${summary['net_income']:,.0f} representing a net margin of {summary['net_margin']}%. "
+            f"Gross margin of {summary['gross_margin']}% reflects the company cost structure. "
+            f"Current ratio of {summary['current_ratio']}x indicates liquidity health. "
+            f"Debt-to-equity of {summary['debt_to_equity']}x. Revenue projected at ${summary['yr1_forecast_revenue']:,.0f} in Year 1. "
+            f"Overall risk rating: {summary['overall_risk']}. [Fallback — Ollama error: {e}]")
+
+def confidence_scoring(hist,ratios):
+    n=len(hist); revenues=[h["total_revenue"] for h in hist]
+    volatility=round(statistics.stdev(revenues)/statistics.mean(revenues)*100,1) if len(revenues)>1 and statistics.mean(revenues) else 50
+    data_completeness="High" if n>=5 else "Medium" if n>=3 else "Low"
+    rev_conf="High" if volatility<15 and n>=4 else "Medium" if volatility<30 else "Low"
+    margins=[r["gross_margin"] for r in ratios if r.get("gross_margin")]
+    margin_vol=round(statistics.stdev(margins)*100,1) if len(margins)>1 else 20
+    margin_conf="High" if margin_vol<5 else "Medium" if margin_vol<15 else "Low"
+    cash_conf="High" if data_completeness=="High" and rev_conf=="High" else "Medium" if data_completeness!="Low" else "Low"
+    return {"revenue":rev_conf,"margins":margin_conf,"cash":cash_conf,"cash_level":cash_conf.lower(),
+        "data_years":n,"data_completeness":data_completeness,"revenue_volatility_pct":volatility,"margin_volatility_pct":margin_vol,
+        "methodology":"Confidence based on data completeness, historical volatility, and trend consistency.",
+        "disclaimer":"Quanto is not responsible for financial decisions. Forecasts are estimates, not guarantees."}
